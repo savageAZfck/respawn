@@ -108,3 +108,10 @@ Absorbs the concepts of the retired stubs `git_fabric`, `blade_subsystem`,
 the snapshot graph, the append-only store, the transport gate, atomic
 state/rollback, and drift-watch — unified into one product instead of
 seven sketches.
+
+## License
+
+Functional Source License 1.1 (FSL-1.1-ALv2) — (c) 2026 Adam Clark.
+Source is open to read, use, and build on for any non-competing purpose;
+converts to Apache-2.0 automatically two years after release.
+Contact savagetism@icloud.com for licensing or partnership.
