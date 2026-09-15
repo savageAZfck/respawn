@@ -9,10 +9,10 @@ env:
 
 # Builds the universal macOS binary, signs it with Sigstore keyless, and
 # publishes the release to the PUBLIC releases repo
-# (savageAZfck/state-fabric-releases) because this source repo is private.
+# (savageAZfck/respawn-releases) because this source repo is private.
 #
 # Requires a repo secret `RELEASE_TOKEN`: a PAT with `repo` scope able to
-# create releases on savageAZfck/state-fabric-releases.
+# create releases on savageAZfck/respawn-releases.
 
 jobs:
   build:
@@ -32,16 +32,16 @@ jobs:
           cargo build --release --target x86_64-apple-darwin
           mkdir -p dist
           lipo -create \
-            target/aarch64-apple-darwin/release/state_fabric \
-            target/x86_64-apple-darwin/release/state_fabric \
-            -output dist/state_fabric
-          tar -czf "dist/state_fabric-${GITHUB_REF_NAME}-macos-universal.tar.gz" -C dist state_fabric
+            target/aarch64-apple-darwin/release/respawn \
+            target/x86_64-apple-darwin/release/respawn \
+            -output dist/respawn
+          tar -czf "dist/respawn-${GITHUB_REF_NAME}-macos-universal.tar.gz" -C dist respawn
           (cd dist && shasum -a 256 *.tar.gz > SHA256SUMS.txt)
       - name: Sign artifacts (keyless, Rekor-logged)
         run: |
           cosign sign-blob --yes \
-            --bundle "dist/state_fabric-${GITHUB_REF_NAME}-macos-universal.tar.gz.sigstore.json" \
-            "dist/state_fabric-${GITHUB_REF_NAME}-macos-universal.tar.gz"
+            --bundle "dist/respawn-${GITHUB_REF_NAME}-macos-universal.tar.gz.sigstore.json" \
+            "dist/respawn-${GITHUB_REF_NAME}-macos-universal.tar.gz"
           cosign sign-blob --yes \
             --bundle "dist/SHA256SUMS.txt.sigstore.json" \
             dist/SHA256SUMS.txt
@@ -50,8 +50,8 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            --repo savageAZfck/state-fabric-releases \
+            --repo savageAZfck/respawn-releases \
             --prerelease \
             --title "$GITHUB_REF_NAME (beta)" \
-            --notes "Universal macOS binary, keyless-signed via Sigstore from CI. Verify: cosign verify-blob --bundle <artifact>.sigstore.json --certificate-identity-regexp 'github.com/savageAZfck/state_fabric' --certificate-oidc-issuer https://token.actions.githubusercontent.com <artifact>. Remove quarantine after download (xattr -d com.apple.quarantine)." \
+            --notes "Universal macOS binary, keyless-signed via Sigstore from CI. Verify: cosign verify-blob --bundle <artifact>.sigstore.json --certificate-identity-regexp 'github.com/savageAZfck/respawn' --certificate-oidc-issuer https://token.actions.githubusercontent.com <artifact>. Remove quarantine after download (xattr -d com.apple.quarantine)." \
             dist/*.tar.gz dist/*.sigstore.json dist/SHA256SUMS.txt

@@ -1,11 +1,11 @@
 [package]
-name = "state_fabric"
+name = "respawn"
 version = "0.1.0"
 edition = "2021"
-description = "Versioned state fabric: content-addressed snapshots, atomic revert, drift detection, LAN sync"
+description = "Versioned respawn: content-addressed snapshots, atomic revert, drift detection, LAN sync"
 license = "LicenseRef-Proprietary"
 authors = ["Adam Clark <savagetism@icloud.com>"]
-repository = "https://github.com/savageAZfck/state_fabric"
+repository = "https://github.com/savageAZfck/respawn"
 
 [dependencies]
 blake3 = "1.5"

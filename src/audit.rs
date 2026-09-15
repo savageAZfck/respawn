@@ -1,7 +1,7 @@
 //! Hash-chained audit log.
 //!
 //! Every state-changing operation appends a JSON line to
-//! `.state_fabric/audit.jsonl`. Each entry's `hash` covers the previous
+//! `.respawn/audit.jsonl`. Each entry's `hash` covers the previous
 //! hash plus the entry body — deleting, editing, or reordering lines
 //! breaks the chain and is detected by `verify`.
 //!

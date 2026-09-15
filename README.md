@@ -1,10 +1,10 @@
-# state_fabric
+# respawn
 
 > **Status: beta.** Format and CLI may change between minor versions. The
 > integrity guarantees below are implemented and tested; there has been no
 > external security audit.
 
-**Undo as infrastructure.** state_fabric versions the state of a directory
+**Undo as infrastructure.** respawn versions the state of a directory
 tree as a content-addressed snapshot graph — every file's content lives in
 the store, so any snapshot can be materialized back exactly. Reverting is a
 HEAD pointer swap plus atomic per-file writes. Drift is a manifest diff.
@@ -14,16 +14,16 @@ Built for the agent era: snapshot the world before an autonomous process
 touches it, revert when it goes wrong, and prove afterward what changed.
 
 ```
-state_fabric init            # create .state_fabric/ in the worktree
-state_fabric snap -m "v1"    # content-addressed snapshot
-state_fabric status          # drift vs HEAD (added/modified/deleted)
-state_fabric diff v1 head    # compare two snapshots
-state_fabric revert <id>     # materialize a snapshot (atomic per file)
-state_fabric log             # snapshot history
-state_fabric verify          # audit chain + object integrity
-state_fabric serve --announce# serve objects to LAN peers
-state_fabric peers           # discover announcing peers
-state_fabric pull host:4789  # replicate a peer's history locally
+respawn init            # create .respawn/ in the worktree
+respawn snap -m "v1"    # content-addressed snapshot
+respawn status          # drift vs HEAD (added/modified/deleted)
+respawn diff v1 head    # compare two snapshots
+respawn revert <id>     # materialize a snapshot (atomic per file)
+respawn log             # snapshot history
+respawn verify          # audit chain + object integrity
+respawn serve --announce# serve objects to LAN peers
+respawn peers           # discover announcing peers
+respawn pull host:4789  # replicate a peer's history locally
 ```
 
 ## What it actually guarantees
@@ -52,7 +52,7 @@ state_fabric pull host:4789  # replicate a peer's history locally
   rewrites one chunk — fine — but content-defined chunking (better dedup
   on inserts) is not implemented yet.
 - **Audit detects tampering, not history rewriting.** An attacker with
-  write access to `.state_fabric/` can replace the whole log; the chain
+  write access to `.respawn/` can replace the whole log; the chain
   only proves the log you have is internally consistent. External anchors
   (signed checkpoints) are future work — see sovereign_ledger for the
   model.
@@ -67,7 +67,7 @@ state_fabric pull host:4789  # replicate a peer's history locally
 
 ```
 worktree/
-  .state_fabric/
+  .respawn/
     objects/<2hex>/<62hex>    zstd-compressed chunks, BLAKE3-addressed
     manifests/<2hex>/<62hex>  bincode manifests; id = BLAKE3 of bytes
     HEAD                      hex id of current snapshot
@@ -79,7 +79,7 @@ worktree/
 
 ```sh
 brew tap savageAZfck/tap
-brew install state-fabric    # 0.1.0-beta, universal macOS binary
+brew install respawn    # 0.1.0-beta, universal macOS binary
 ```
 
 ## Consolidation note

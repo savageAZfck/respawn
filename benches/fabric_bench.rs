@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use state_fabric::{drift, snapshot, Store};
+use respawn::{drift, snapshot, Store};
 use std::fs;
 use tempfile::TempDir;
 

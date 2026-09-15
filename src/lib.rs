@@ -1,6 +1,6 @@
-//! state_fabric — a versioned fabric for filesystem state.
+//! respawn — a versioned fabric for filesystem state.
 //!
-//! Content-addressed snapshots of a directory tree, stored in `.state_fabric/`
+//! Content-addressed snapshots of a directory tree, stored in `.respawn/`
 //! under the worktree root. Reverting is a HEAD pointer swap plus atomic
 //! per-file materialization; drift is a manifest diff; sync is object
 //! replication between peers over the LAN. Every mutation is recorded in a
@@ -22,7 +22,7 @@ use std::io;
 pub type Hash = [u8; 32];
 
 /// Directory inside the worktree that holds all fabric state.
-pub const FABRIC_DIR: &str = ".state_fabric";
+pub const FABRIC_DIR: &str = ".respawn";
 
 /// Fixed chunk size for file content. Content-defined chunking is a
 /// possible future optimization; fixed chunks keep dedup predictable.
@@ -45,7 +45,7 @@ impl std::fmt::Display for Error {
             Error::Corrupt(m) => write!(f, "corrupt state: {m}"),
             Error::MissingObject(h) => write!(f, "missing object {}", hex::encode(h)),
             Error::NotInitialized => {
-                write!(f, "not a state_fabric worktree (run `state_fabric init`)")
+                write!(f, "not a respawn worktree (run `respawn init`)")
             }
             Error::BadHash(m) => write!(f, "bad hash: {m}"),
             Error::Sync(m) => write!(f, "sync error: {m}"),

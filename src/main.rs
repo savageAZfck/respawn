@@ -1,12 +1,12 @@
 use clap::{Parser, Subcommand};
-use state_fabric::snapshot;
-use state_fabric::{audit, drift, revert, sync, watch, Error, Result, Store};
+use respawn::snapshot;
+use respawn::{audit, drift, revert, sync, watch, Error, Result, Store};
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    name = "state_fabric",
-    about = "Versioned state fabric: snapshots, atomic revert, drift detection, LAN sync",
+    name = "respawn",
+    about = "Versioned respawn: snapshots, atomic revert, drift detection, LAN sync",
     version
 )]
 struct Cli {
@@ -128,13 +128,13 @@ fn run() -> Result<()> {
             Store::init(&dir)?;
             let store = Store::open(&dir)?;
             audit::record(&store, "init", dir.to_string_lossy().as_ref())?;
-            println!("initialized state fabric in {}", dir.display());
+            println!("initialized respawn in {}", dir.display());
         }
         Cmd::Snap { message } => {
             let (store, root) = open_store()?;
             let id = snapshot::create(&store, &root, &message)?;
-            audit::record(&store, "snap", &state_fabric::hash_hex(&id))?;
-            println!("snapshot {}", state_fabric::hash_hex(&id));
+            audit::record(&store, "snap", &respawn::hash_hex(&id))?;
+            println!("snapshot {}", respawn::hash_hex(&id));
         }
         Cmd::Log { n } => {
             let (store, _) = open_store()?;
@@ -148,7 +148,7 @@ fn run() -> Result<()> {
                 };
                 println!(
                     "{}  {}{}  ({} files){}",
-                    state_fabric::short(&id),
+                    respawn::short(&id),
                     chrono_ts(m.timestamp_secs),
                     msg,
                     m.files.len(),
@@ -160,9 +160,9 @@ fn run() -> Result<()> {
             let (store, _) = open_store()?;
             let id = snapshot::resolve(&store, &id)?;
             let m = snapshot::load(&store, &id)?;
-            println!("snapshot {}", state_fabric::hash_hex(&id));
+            println!("snapshot {}", respawn::hash_hex(&id));
             if let Some(p) = m.parent {
-                println!("parent   {}", state_fabric::hash_hex(&p));
+                println!("parent   {}", respawn::hash_hex(&p));
             }
             println!("time     {}", chrono_ts(m.timestamp_secs));
             if !m.message.is_empty() {
@@ -178,7 +178,7 @@ fn run() -> Result<()> {
             let id = snapshot::resolve(&store, &id)?;
             let m = snapshot::load(&store, &id)?;
             let r = drift::detect(&root, &m)?;
-            println!("drift vs {}:", state_fabric::short(&id));
+            println!("drift vs {}:", respawn::short(&id));
             print_drift(&r);
         }
         Cmd::Diff { old, new } => {
@@ -226,14 +226,14 @@ fn run() -> Result<()> {
                         "revert",
                         &format!(
                             "{} restored {} removed {}",
-                            state_fabric::short(&id),
+                            respawn::short(&id),
                             r.restored.len(),
                             r.removed.len()
                         ),
                     )?;
                     println!(
                         "reverted to {}: {} restored, {} removed, {} extra kept",
-                        state_fabric::short(&id),
+                        respawn::short(&id),
                         r.restored.len(),
                         r.removed.len(),
                         r.skipped_extra.len()
@@ -270,7 +270,7 @@ fn run() -> Result<()> {
                     for e in std::fs::read_dir(fan.path())? {
                         let e = e?;
                         let full = format!("{}{}", fan_hex, e.file_name().to_string_lossy());
-                        let h = state_fabric::parse_hash(&full)?;
+                        let h = respawn::parse_hash(&full)?;
                         match store.get_object(&h) {
                             Ok(_) => checked += 1,
                             Err(_) => bad += 1,
@@ -310,7 +310,7 @@ fn run() -> Result<()> {
                         "pull",
                         &format!(
                             "{addr} head {} objects {}",
-                            state_fabric::short(&h),
+                            respawn::short(&h),
                             r.objects_fetched
                         ),
                     )?;
@@ -318,7 +318,7 @@ fn run() -> Result<()> {
                         "pulled {} manifests, {} objects ({} skipped) from {addr}",
                         r.manifests_fetched, r.objects_fetched, r.objects_skipped
                     );
-                    println!("remote head: {}", state_fabric::hash_hex(&h));
+                    println!("remote head: {}", respawn::hash_hex(&h));
                 }
                 None => println!("remote has no snapshots"),
             }

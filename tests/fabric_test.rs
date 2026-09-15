@@ -1,4 +1,4 @@
-use state_fabric::{audit, drift, revert, snapshot, sync, Store};
+use respawn::{audit, drift, revert, snapshot, sync, Store};
 use std::fs;
 use std::net::TcpListener;
 use std::path::Path;
@@ -116,9 +116,9 @@ fn tampered_object_detected() {
     let chunk = m.files.iter().find(|f| f.path == "a.txt").unwrap().chunks[0];
 
     // Corrupt the stored object on disk.
-    let hex = state_fabric::hash_hex(&chunk);
+    let hex = respawn::hash_hex(&chunk);
     let obj = root
-        .join(".state_fabric/objects")
+        .join(".respawn/objects")
         .join(&hex[..2])
         .join(&hex[2..]);
     let mut raw = fs::read(&obj).unwrap();
@@ -140,7 +140,7 @@ fn audit_chain_detects_tamper() {
     assert!(r.valid && r.entries == 2);
 
     // Edit a line → chain breaks.
-    let p = root.join(".state_fabric/audit.jsonl");
+    let p = root.join(".respawn/audit.jsonl");
     let content = fs::read_to_string(&p).unwrap();
     let tampered = content.replace("\"snap\"", "\"span\"");
     fs::write(&p, tampered).unwrap();
