@@ -17,6 +17,7 @@ use crate::{Error, Hash, Result, Store};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,11 +30,36 @@ const OP_GET_MANIFEST: u8 = 0x02;
 const OP_HAVE: u8 = 0x03;
 const OP_GET_OBJECT: u8 = 0x04;
 
+const MAX_FRAME: usize = 64 * 1024 * 1024;
+const MAX_MANIFESTS_PER_PULL: usize = 100_000;
+const MAX_OBJECTS_PER_PULL: usize = 8_000_000;
+/// Hashes per HAVE request — keeps request frames well under MAX_FRAME.
+const HAVE_BATCH: usize = 500_000;
+const MAX_CONNECTIONS: usize = 64;
+
+fn read_u64(frame: &[u8]) -> Result<u64> {
+    if frame.len() < 8 {
+        return Err(Error::Sync("short frame".into()));
+    }
+    Ok(u64::from_le_bytes(frame[..8].try_into().unwrap()))
+}
+
+fn frame_payload(frame: &[u8]) -> Result<&[u8]> {
+    let len = read_u64(frame)? as usize;
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if frame.len() < 8 + len {
+        return Err(Error::Sync("truncated frame payload".into()));
+    }
+    Ok(&frame[8..8 + len])
+}
+
 fn read_frame(s: &mut TcpStream) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     s.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
-    if len > 64 * 1024 * 1024 {
+    if len > MAX_FRAME {
         return Err(Error::Sync("frame too large".into()));
     }
     let mut buf = vec![0u8; len];
@@ -93,10 +119,12 @@ fn respond(s: &mut TcpStream, store: &Store, frame: &[u8]) -> Result<()> {
 }
 
 /// Serve object requests on `addr` until killed. `--announce` spawns a
-/// UDP beacon thread.
+/// UDP beacon thread. Connections are capped — each costs a thread, so
+/// an unbounded accept loop would be a one-line DoS.
 pub fn serve(store: Store, addr: &str, announce: bool) -> Result<()> {
     let listener = TcpListener::bind(addr)?;
     let store = Arc::new(store);
+    let conns = Arc::new(AtomicUsize::new(0));
 
     if announce {
         let port = listener.local_addr()?.port();
@@ -116,7 +144,12 @@ pub fn serve(store: Store, addr: &str, announce: bool) -> Result<()> {
             Ok(c) => c,
             Err(_) => continue,
         };
+        if conns.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+            continue; // over capacity — drop on the floor
+        }
+        conns.fetch_add(1, Ordering::Relaxed);
         let st = Arc::clone(&store);
+        let count = Arc::clone(&conns);
         std::thread::spawn(move || {
             let mut s = conn;
             while let Ok(frame) = read_frame(&mut s) {
@@ -124,6 +157,7 @@ pub fn serve(store: Store, addr: &str, announce: bool) -> Result<()> {
                     break;
                 }
             }
+            count.fetch_sub(1, Ordering::Relaxed);
         });
     }
     Ok(())
@@ -159,6 +193,11 @@ pub struct PullReport {
 
 /// Pull the remote's HEAD chain + all missing objects into the local
 /// store. Does not touch the worktree or local HEAD — `revert` after.
+///
+/// Everything the remote sends is attacker-controlled: every slice is
+/// bounds-checked, every object and manifest is hash-verified and
+/// validated before it is accepted, the parent walk is cycle-guarded
+/// and capped, and nothing from the wire ever reaches the worktree.
 pub fn pull(store: &Store, addr: &str) -> Result<PullReport> {
     let mut report = PullReport::default();
     let mut s =
@@ -168,41 +207,53 @@ pub fn pull(store: &Store, addr: &str) -> Result<PullReport> {
 
     write_frame(&mut s, &[OP_GET_HEAD])?;
     let resp = read_frame(&mut s)?;
-    if resp.first().copied() != Some(1) {
-        return Ok(report); // remote has no head
+    if resp.len() != 33 || resp[0] != 1 {
+        if resp.first().copied() == Some(0) {
+            return Ok(report); // remote has no head
+        }
+        return Err(Error::Sync("malformed HEAD response".into()));
     }
     let remote_head: Hash = resp[1..33].try_into().unwrap();
     report.remote_head = Some(remote_head);
 
     // Walk the remote manifest chain until we reach one we already have.
-    let mut wanted_manifests: Vec<Hash> = Vec::new();
+    // visited guards cycles; the cap bounds a hostile infinite chain.
     let mut needed_objects: Vec<Hash> = Vec::new();
+    let mut visited = std::collections::HashSet::new();
     let mut cur = remote_head;
     loop {
         if store.has_manifest(&cur) {
             break;
         }
+        if !visited.insert(cur) {
+            return Err(Error::Sync("manifest chain cycle".into()));
+        }
+        if visited.len() > MAX_MANIFESTS_PER_PULL {
+            return Err(Error::Sync("manifest chain too long".into()));
+        }
         let mut req = vec![OP_GET_MANIFEST];
         req.extend_from_slice(&cur);
         write_frame(&mut s, &req)?;
         let resp = read_frame(&mut s)?;
-        let len = u64::from_le_bytes(resp[..8].try_into().unwrap()) as usize;
-        if len == 0 {
+        let data = frame_payload(&resp)?;
+        if data.is_empty() {
             return Err(Error::Sync(format!(
                 "remote missing manifest {}",
                 crate::short(&cur)
             )));
         }
-        let data = &resp[8..8 + len];
         store.put_manifest_as(&cur, data)?;
         report.manifests_fetched += 1;
-        wanted_manifests.push(cur);
 
         let m = crate::snapshot::Manifest::deserialize(data)?;
+        m.validate()?;
         for fe in &m.files {
             for ch in &fe.chunks {
                 needed_objects.push(*ch);
             }
+        }
+        if needed_objects.len() > MAX_OBJECTS_PER_PULL {
+            return Err(Error::Sync("pull exceeds object cap".into()));
         }
         match m.parent {
             Some(p) => cur = p,
@@ -210,34 +261,35 @@ pub fn pull(store: &Store, addr: &str) -> Result<PullReport> {
         }
     }
 
-    // Deduplicate, then filter through HAVE to fetch only what's missing.
+    // Deduplicate, then filter through HAVE (batched so the request
+    // stays under the frame cap) to fetch only what's missing.
     needed_objects.sort();
     needed_objects.dedup();
-    if !needed_objects.is_empty() {
+    for batch in needed_objects.chunks(HAVE_BATCH) {
         let mut req = vec![OP_HAVE];
-        req.extend_from_slice(&(needed_objects.len() as u32).to_le_bytes());
-        for h in &needed_objects {
+        req.extend_from_slice(&(batch.len() as u32).to_le_bytes());
+        for h in batch {
             req.extend_from_slice(h);
         }
         write_frame(&mut s, &req)?;
         let have = read_frame(&mut s)?;
-        if have.len() != needed_objects.len() {
+        if have.len() != batch.len() {
             return Err(Error::Sync("HAVE response truncated".into()));
         }
-        for (i, h) in needed_objects.iter().enumerate() {
+        for (i, h) in batch.iter().enumerate() {
             if have[i] == 1 && !store.has_object(h) {
                 let mut req = vec![OP_GET_OBJECT];
                 req.extend_from_slice(h);
                 write_frame(&mut s, &req)?;
                 let resp = read_frame(&mut s)?;
-                let len = u64::from_le_bytes(resp[..8].try_into().unwrap()) as usize;
-                if len == 0 {
+                let data = frame_payload(&resp)?;
+                if data.is_empty() {
                     return Err(Error::Sync(format!(
                         "remote missing object {}",
                         crate::short(h)
                     )));
                 }
-                store.put_object_as(h, &resp[8..8 + len])?;
+                store.put_object_as(h, data)?;
                 report.objects_fetched += 1;
             } else {
                 report.objects_skipped += 1;
@@ -252,8 +304,18 @@ pub fn pull(store: &Store, addr: &str) -> Result<PullReport> {
     Ok(report)
 }
 
+/// Peer addresses become filenames under `.respawn/remotes/` — keep
+/// only characters that can never traverse or surprise a filesystem.
 fn sanitize(addr: &str) -> String {
-    addr.replace([':', '/', '\\'], "_")
+    addr.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Ensure a fabric exists at `root` for tests / embedding.

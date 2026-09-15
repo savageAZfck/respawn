@@ -83,13 +83,7 @@ impl Store {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension("tmp");
-        {
-            let mut f = fs::File::create(&tmp)?;
-            f.write_all(&compressed)?;
-            f.sync_all()?;
-        }
-        fs::rename(&tmp, &path)?;
+        self.atomic_write(&path, &compressed)?;
         Ok(h)
     }
 
@@ -107,6 +101,9 @@ impl Store {
     }
 
     /// Read and decompress an object; verifies content hash on read.
+    /// Objects are always file chunks, so decompressed size is bounded —
+    /// a blob that inflates past CHUNK_SIZE is rejected before the hash
+    /// check even runs.
     pub fn get_object(&self, h: &Hash) -> Result<Vec<u8>> {
         let path = self.object_path(h);
         let compressed = fs::read(&path).map_err(|e| {
@@ -116,7 +113,16 @@ impl Store {
                 Error::Io(e)
             }
         })?;
-        let data = zstd::decode_all(&compressed[..]).map_err(Error::Io)?;
+        let decoder = zstd::Decoder::new(&compressed[..]).map_err(Error::Io)?;
+        let mut data = Vec::new();
+        let mut bounded = decoder.take(crate::CHUNK_SIZE as u64 + 1);
+        bounded.read_to_end(&mut data).map_err(Error::Io)?;
+        if data.len() > crate::CHUNK_SIZE {
+            return Err(Error::Corrupt(format!(
+                "object {} exceeds chunk bound",
+                crate::short(h)
+            )));
+        }
         if hash_bytes(&data) != *h {
             return Err(Error::Corrupt(format!(
                 "object {} failed content verification",
@@ -140,9 +146,7 @@ impl Store {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, data)?;
-        fs::rename(&tmp, &path)?;
+        self.atomic_write(&path, data)?;
         Ok(h)
     }
 
@@ -170,14 +174,20 @@ impl Store {
         self.manifest_path(h).exists()
     }
 
-    /// Current HEAD snapshot id, if any.
+    /// Current HEAD snapshot id, if any. A missing HEAD file means no
+    /// snapshots; other IO errors are real and propagated.
     pub fn head(&self) -> Result<Option<Hash>> {
-        let s = fs::read_to_string(self.fabric_dir().join("HEAD")).unwrap_or_default();
-        let s = s.trim();
-        if s.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(crate::parse_hash(s)?))
+        match fs::read_to_string(self.fabric_dir().join("HEAD")) {
+            Ok(s) => {
+                let s = s.trim();
+                if s.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(crate::parse_hash(s)?))
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Io(e)),
         }
     }
 
@@ -187,9 +197,28 @@ impl Store {
             Some(h) => crate::hash_hex(h),
             None => String::new(),
         };
-        let tmp = self.fabric_dir().join("HEAD.tmp");
-        fs::write(&tmp, content)?;
-        fs::rename(&tmp, self.fabric_dir().join("HEAD"))?;
+        self.atomic_write(&self.fabric_dir().join("HEAD"), content.as_bytes())
+    }
+
+    /// Write `data` to `path` via a uniquely-named sibling tmp file,
+    /// then rename. `create_new` means a pre-existing file (planted
+    /// symlink, racing writer) can never be truncated or followed.
+    fn atomic_write(&self, path: &Path, data: &[u8]) -> Result<()> {
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(dir)?;
+        let tmp = crate::tmp_path(
+            dir,
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("x"),
+        );
+        {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            f.write_all(data)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, path)?;
         Ok(())
     }
 

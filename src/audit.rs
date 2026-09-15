@@ -25,7 +25,11 @@ pub struct AuditEntry {
 }
 
 fn entry_hash(seq: u64, ts: u64, event: &str, detail: &str, prev: &str) -> String {
-    let body = format!("{seq}|{ts}|{event}|{detail}|{prev}");
+    // Serialize the tuple rather than joining with a separator — a
+    // delimiter inside a field could otherwise collide two different
+    // entries onto the same hash input.
+    let body = serde_json::to_string(&(seq, ts, event, detail, prev))
+        .unwrap_or_else(|_| format!("{seq}{ts}"));
     hex::encode(hash_bytes(body.as_bytes()))
 }
 

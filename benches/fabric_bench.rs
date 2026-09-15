@@ -30,7 +30,7 @@ fn bench_drift_clean(c: &mut Criterion) {
     snapshot::create(&store, t.path(), "bench").unwrap();
     let m = snapshot::load(&store, &store.head().unwrap().unwrap()).unwrap();
     c.bench_function("drift clean 200 files", |b| {
-        b.iter(|| drift::detect(t.path(), &m).unwrap())
+        b.iter(|| drift::detect(t.path(), &m, false).unwrap())
     });
 }
 
@@ -48,7 +48,7 @@ fn bench_drift_dirty(c: &mut Criterion) {
     }
     let m = snapshot::load(&store, &store.head().unwrap().unwrap()).unwrap();
     c.bench_function("drift 10% dirty 200 files", |b| {
-        b.iter(|| drift::detect(t.path(), &m).unwrap())
+        b.iter(|| drift::detect(t.path(), &m, false).unwrap())
     });
 }
 

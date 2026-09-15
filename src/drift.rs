@@ -52,8 +52,11 @@ fn excluded(rel: &Path) -> bool {
     })
 }
 
-/// Compute drift of the live worktree vs `manifest`.
-pub fn detect(root: &Path, manifest: &Manifest) -> Result<DriftReport> {
+/// Compute drift of the live worktree vs `manifest`. With `full`,
+/// every tracked file is rehashed — the (size, mtime) fast path is
+/// skipped, so files whose metadata was forged or restored after a
+/// modification are still caught.
+pub fn detect(root: &Path, manifest: &Manifest, full: bool) -> Result<DriftReport> {
     let expected: HashMap<&str, &FileEntry> = manifest
         .files
         .iter()
@@ -89,13 +92,17 @@ pub fn detect(root: &Path, manifest: &Manifest) -> Result<DriftReport> {
         match expected.get(rel_str.as_str()) {
             None => report.added.push(rel_str),
             Some(fe) => {
-                let mtime = meta
+                let (mtime_secs, mtime_nanos) = meta
                     .modified()
                     .ok()
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                if meta.len() == fe.size && mtime == fe.mtime_secs {
+                    .map(|d| (d.as_secs(), d.subsec_nanos()))
+                    .unwrap_or((0, 0));
+                if !full
+                    && meta.len() == fe.size
+                    && mtime_secs == fe.mtime_secs
+                    && mtime_nanos == fe.mtime_nanos
+                {
                     continue; // fast path: untouched
                 }
                 let h = file_hash(entry.path())?;

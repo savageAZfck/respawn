@@ -14,15 +14,23 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 2;
+
+/// Hard caps applied when accepting a manifest — chiefly from `pull`,
+/// where a hostile peer controls the bytes.
+pub const MAX_MANIFEST_FILES: usize = 2_000_000;
+pub const MAX_MANIFEST_CHUNKS: usize = 8_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
     /// Relative path from worktree root, '/'-separated.
     pub path: String,
+    /// Permission bits only (masked with 0o777 on apply — special bits
+    /// like setuid are never honored).
     pub mode: u32,
     pub size: u64,
     pub mtime_secs: u64,
+    pub mtime_nanos: u32,
     /// BLAKE3 of the full file content.
     pub content: Hash,
     /// Ordered chunk hashes; file content = concat(chunk bytes).
@@ -40,18 +48,58 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn serialize(&self) -> Result<Vec<u8>> {
-        bincode::serialize(self).map_err(|e| Error::Corrupt(format!("manifest encode: {e}")))
+        serde_json::to_vec(self).map_err(Error::from)
     }
 
+    /// Manifests are JSON — inspectable with any tool. A size bound on
+    /// the bytes keeps a hostile peer from driving decode allocations
+    /// with a huge length prefix.
     pub fn deserialize(data: &[u8]) -> Result<Self> {
-        bincode::deserialize(data).map_err(|e| Error::Corrupt(format!("manifest decode: {e}")))
+        if data.len() > 256 * 1024 * 1024 {
+            return Err(Error::Corrupt("manifest exceeds size cap".into()));
+        }
+        serde_json::from_slice(data).map_err(Error::from)
+    }
+
+    /// Reject manifests that could not have been produced by `create`:
+    /// wrong version, unsafe paths, or absurd counts. Called on every
+    /// load and again before `revert` writes anything — a manifest that
+    /// arrived over the wire is attacker-controlled bytes.
+    pub fn validate(&self) -> Result<()> {
+        if self.version != MANIFEST_VERSION {
+            return Err(Error::Corrupt(format!(
+                "unsupported manifest version {}",
+                self.version
+            )));
+        }
+        if self.files.len() > MAX_MANIFEST_FILES {
+            return Err(Error::Corrupt("manifest exceeds file count cap".into()));
+        }
+        let mut total_chunks = 0usize;
+        for f in &self.files {
+            crate::sanitize_rel(&f.path)?;
+            total_chunks += f.chunks.len();
+            if total_chunks > MAX_MANIFEST_CHUNKS {
+                return Err(Error::Corrupt("manifest exceeds chunk count cap".into()));
+            }
+            if f.chunks.is_empty() && f.size > 0 {
+                return Err(Error::Corrupt(format!(
+                    "non-empty file with no chunks: {}",
+                    f.path
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
-/// Load a manifest by snapshot id.
+/// Load a manifest by snapshot id. Validates before returning — the
+/// caller can trust paths are safe to join under the worktree root.
 pub fn load(store: &Store, id: &Hash) -> Result<Manifest> {
     let bytes = store.get_manifest_bytes(id)?;
-    Manifest::deserialize(&bytes)
+    let m = Manifest::deserialize(&bytes)?;
+    m.validate()?;
+    Ok(m)
 }
 
 /// Resolve a snapshot reference: full hex, unique hex prefix, or "head".
@@ -81,7 +129,7 @@ pub fn resolve(store: &Store, reference: &str) -> Result<Hash> {
             for e in fs::read_dir(fan.path())? {
                 let e = e?;
                 let full = format!("{}{}", fan_hex, e.file_name().to_string_lossy());
-                if full.starts_with(&prefix) {
+                if full.starts_with(&prefix) && crate::is_hash_name(&full) {
                     hits.push(crate::parse_hash(&full)?);
                 }
             }
@@ -152,20 +200,22 @@ pub fn create(store: &Store, root: &Path, message: &str) -> Result<Hash> {
         if patterns.iter().any(|p| rel_str.contains(p.as_str())) {
             continue;
         }
+        crate::sanitize_rel(&rel_str)?;
         let meta = entry.metadata()?;
         let (content, chunks, size) = chunk_file(store, entry.path())?;
-        let mtime = meta
+        let (mtime_secs, mtime_nanos) = meta
             .modified()
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map(|d| (d.as_secs(), d.subsec_nanos()))
+            .unwrap_or((0, 0));
         let mode = unix_mode(&meta);
         files.push(FileEntry {
             path: rel_str,
             mode,
             size,
-            mtime_secs: mtime,
+            mtime_secs,
+            mtime_nanos,
             content,
             chunks,
         });
@@ -215,6 +265,9 @@ pub fn list(store: &Store) -> Result<Vec<(Hash, Manifest)>> {
             for e in fs::read_dir(fan.path())? {
                 let e = e?;
                 let full = format!("{}{}", fan_hex, e.file_name().to_string_lossy());
+                if !crate::is_hash_name(&full) {
+                    continue;
+                }
                 let id = crate::parse_hash(&full)?;
                 if seen.insert(id) {
                     if let Ok(m) = load(store, &id) {

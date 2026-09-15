@@ -32,13 +32,55 @@ fn excluded(rel: &Path) -> bool {
 #[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    // Only plain permission bits are honored — a manifest carrying
+    // setuid/setgid/sticky bits must not propagate them to the disk.
+    fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
 fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
+}
+
+/// Resolve a manifest path to a destination inside `root`, verifying
+/// that no existing ancestor component is a symlink — a planted link
+/// (e.g. from an extracted archive or a malicious script) must not let
+/// a revert write outside the worktree. Path syntax itself was already
+/// validated by `Manifest::validate`; this guards the on-disk reality.
+fn resolve_dest(root: &Path, rel: &str) -> Result<PathBuf> {
+    let rel = crate::sanitize_rel(rel)?;
+    let dest = root.join(&rel);
+
+    // Walk each ancestor between root and dest: if it exists, it must
+    // be a real directory or a plain file that will be replaced.
+    let mut cur = root.to_path_buf();
+    for comp in rel.components() {
+        cur.push(comp.as_os_str());
+        if cur == dest {
+            break;
+        }
+        match fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(Error::UnsafePath(format!(
+                    "{} passes through symlink {}",
+                    rel.display(),
+                    cur.display()
+                )));
+            }
+            Ok(m) if m.is_dir() => continue,
+            Ok(_) => {
+                return Err(Error::UnsafePath(format!(
+                    "{} blocked by non-directory {}",
+                    rel.display(),
+                    cur.display()
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
+    Ok(dest)
 }
 
 /// Materialize `manifest` into `root`. Verifies content hashes as it
@@ -49,18 +91,27 @@ pub fn apply(
     manifest: &Manifest,
     keep_extra: bool,
 ) -> Result<RevertReport> {
+    // Defense in depth: callers normally hand us a manifest already
+    // validated by load(), but apply is the write boundary — a manifest
+    // that escapes validation anywhere must still not write here.
+    manifest.validate()?;
+
     let mut report = RevertReport::default();
     let wanted: HashSet<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
+    let tmp_dir = store.fabric_dir().join("tmp");
+    fs::create_dir_all(&tmp_dir)?;
 
     for fe in &manifest.files {
-        let dest = root.join(&fe.path);
+        let dest = resolve_dest(root, &fe.path)?;
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
 
         // Skip rewrite if the live file already matches the manifest.
-        let needs_write = match fs::metadata(&dest) {
-            Ok(m) if m.is_file() => {
+        // symlink_metadata: a symlink at dest is NOT a match — it gets
+        // replaced rather than followed.
+        let needs_write = match fs::symlink_metadata(&dest) {
+            Ok(m) if m.is_file() && !m.file_type().is_symlink() => {
                 let h = drift_file_hash(&dest)?;
                 h != fe.content
             }
@@ -70,9 +121,15 @@ pub fn apply(
             continue;
         }
 
-        let tmp = dest.with_extension("sf-tmp");
+        // Materialize inside the fabric dir (same filesystem as the
+        // worktree) so rename stays atomic and a pre-planted file at a
+        // predictable tmp name can't be followed.
+        let tmp = crate::tmp_path(&tmp_dir, "revert");
         {
-            let mut out = fs::File::create(&tmp)?;
+            let mut out = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
             let mut hasher = blake3::Hasher::new();
             for ch in &fe.chunks {
                 let data = store.get_object(ch)?;
@@ -81,6 +138,7 @@ pub fn apply(
             }
             let digest = hasher.finalize();
             if digest.as_bytes() != &fe.content {
+                drop(out);
                 let _ = fs::remove_file(&tmp);
                 return Err(Error::Corrupt(format!(
                     "reconstructed content mismatch for {}",
@@ -94,10 +152,13 @@ pub fn apply(
         report.restored.push(fe.path.clone());
     }
 
-    // Remove files the manifest doesn't know about.
+    // Remove files the manifest doesn't know about. Symlinks count as
+    // removable entries — a link the manifest doesn't know about gets
+    // unlinked (the link itself, never its target).
     for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
         let entry = entry?;
-        if !entry.file_type().is_file() {
+        let ft = entry.file_type();
+        if !ft.is_file() && !ft.is_symlink() {
             continue;
         }
         let rel = entry.path().strip_prefix(root).unwrap().to_path_buf();
@@ -160,17 +221,20 @@ pub fn check_then_apply(
     let head = store.head()?;
     let report = if let Some(h) = head {
         let cur = crate::snapshot::load(store, &h)?;
-        drift::detect(root, &cur)?
+        // Full rehash: this gate decides whether to destroy work, so the
+        // mtime fast path is not trusted here.
+        drift::detect(root, &cur, true)?
     } else {
         drift::detect(
             root,
             &Manifest {
-                version: 1,
+                version: crate::snapshot::MANIFEST_VERSION,
                 parent: None,
                 timestamp_secs: 0,
                 message: String::new(),
                 files: Vec::new(),
             },
+            false,
         )?
     };
 

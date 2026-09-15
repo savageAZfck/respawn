@@ -36,6 +36,7 @@ pub enum Error {
     NotInitialized,
     BadHash(String),
     Sync(String),
+    UnsafePath(String),
 }
 
 impl std::fmt::Display for Error {
@@ -49,6 +50,7 @@ impl std::fmt::Display for Error {
             }
             Error::BadHash(m) => write!(f, "bad hash: {m}"),
             Error::Sync(m) => write!(f, "sync error: {m}"),
+            Error::UnsafePath(p) => write!(f, "unsafe path in manifest: {p:?}"),
         }
     }
 }
@@ -97,4 +99,43 @@ pub fn hash_hex(h: &Hash) -> String {
 /// Short hash prefix for display.
 pub fn short(h: &Hash) -> String {
     hex::encode(&h[..6])
+}
+
+/// A relative path is only acceptable if every component is a plain
+/// directory/file name — no root, no `..`, no `.`, no NUL or separators
+/// that could escape the worktree or smuggle a host-absolute path.
+pub fn sanitize_rel(p: &str) -> Result<std::path::PathBuf> {
+    use std::path::Component;
+    if p.is_empty() || p.len() > 1024 || p.contains('\0') || p.contains('\\') {
+        return Err(Error::UnsafePath(p.to_string()));
+    }
+    let path = std::path::Path::new(p);
+    if path.is_absolute() {
+        return Err(Error::UnsafePath(p.to_string()));
+    }
+    for c in path.components() {
+        if !matches!(c, Component::Normal(_)) {
+            return Err(Error::UnsafePath(p.to_string()));
+        }
+    }
+    Ok(path.to_path_buf())
+}
+
+/// True if `name` is exactly 64 lowercase hex chars — the on-disk shape
+/// of object and manifest ids. Used to skip foreign files (`.tmp`,
+/// editor droppings) inside store fan-out dirs.
+pub fn is_hash_name(name: &str) -> bool {
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Unique tmp filename inside `dir` — unpredictable enough that a
+/// pre-planted file or concurrent writer cannot collide with it.
+pub fn tmp_path(dir: &std::path::Path, tag: &str) -> std::path::PathBuf {
+    let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    dir.join(format!(".tmp-{}-{n}-{tag}", std::process::id()))
 }

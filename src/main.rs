@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "respawn",
-    about = "Versioned respawn: snapshots, atomic revert, drift detection, LAN sync",
+    about = "respawn: content-addressed snapshots, atomic revert, drift detection, LAN sync",
     version
 )]
 struct Cli {
@@ -43,6 +43,9 @@ enum Cmd {
     Status {
         #[arg(default_value = "head")]
         id: String,
+        /// Rehash every file — don't trust size+mtime (slower, airtight)
+        #[arg(long)]
+        full: bool,
     },
     /// Diff two snapshots (old -> new)
     Diff {
@@ -69,9 +72,9 @@ enum Cmd {
         #[arg(long)]
         objects: bool,
     },
-    /// Serve objects to peers on ADDR (default :4789)
+    /// Serve objects to peers on ADDR (default loopback only)
     Serve {
-        #[arg(default_value = "0.0.0.0:4789")]
+        #[arg(default_value = "127.0.0.1:4789")]
         addr: String,
         /// Broadcast a UDP discovery beacon
         #[arg(long)]
@@ -173,11 +176,11 @@ fn run() -> Result<()> {
                 println!("  {:>10}  {}", f.size, f.path);
             }
         }
-        Cmd::Status { id } => {
+        Cmd::Status { id, full } => {
             let (store, root) = open_store()?;
             let id = snapshot::resolve(&store, &id)?;
             let m = snapshot::load(&store, &id)?;
-            let r = drift::detect(&root, &m)?;
+            let r = drift::detect(&root, &m, full)?;
             println!("drift vs {}:", respawn::short(&id));
             print_drift(&r);
         }
@@ -266,10 +269,16 @@ fn run() -> Result<()> {
                 let odir = store.fabric_dir().join("objects");
                 for fan in std::fs::read_dir(&odir)? {
                     let fan = fan?;
+                    if !fan.file_type()?.is_dir() {
+                        continue;
+                    }
                     let fan_hex = fan.file_name().to_string_lossy().to_string();
                     for e in std::fs::read_dir(fan.path())? {
                         let e = e?;
                         let full = format!("{}{}", fan_hex, e.file_name().to_string_lossy());
+                        if !respawn::is_hash_name(&full) {
+                            continue; // foreign file, not an object
+                        }
                         let h = respawn::parse_hash(&full)?;
                         match store.get_object(&h) {
                             Ok(_) => checked += 1,
@@ -288,6 +297,12 @@ fn run() -> Result<()> {
         }
         Cmd::Serve { addr, announce } => {
             let (store, _) = open_store()?;
+            if !is_loopback(&addr) {
+                eprintln!(
+                    "warning: serving on {addr} exposes snapshots to the network — \
+                     anyone who can reach it can read snapshotted content"
+                );
+            }
             println!(
                 "serving on {addr}{}",
                 if announce { " (announcing)" } else { "" }
@@ -325,6 +340,13 @@ fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn is_loopback(addr: &str) -> bool {
+    addr.split(':')
+        .next()
+        .map(|h| h == "127.0.0.1" || h == "localhost" || h == "::1" || h == "[::1]")
+        .unwrap_or(false)
 }
 
 fn chrono_ts(secs: u64) -> String {

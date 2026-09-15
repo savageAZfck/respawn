@@ -5,6 +5,15 @@
 use crate::{Result, FABRIC_DIR};
 use notify::{RecursiveMode, Watcher};
 use std::path::Path;
+
+/// Same rule as snapshot/drift: fabric internals and .git are excluded
+/// by component, not by prefix (so `.github` still reports).
+fn is_tracked(rel: &Path) -> bool {
+    rel.components().all(|c| {
+        let s = c.as_os_str().to_string_lossy();
+        s != FABRIC_DIR && s != ".git"
+    })
+}
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
@@ -33,9 +42,8 @@ pub fn watch_loop<F: FnMut(Vec<String>)>(root: &Path, mut on_event: F) -> Result
                 Ok(Ok(event)) => {
                     for p in event.paths {
                         if let Ok(rel) = p.strip_prefix(root) {
-                            let s = rel.to_string_lossy().replace('\\', "/");
-                            if !s.starts_with(FABRIC_DIR) && !s.starts_with(".git") {
-                                paths.insert(s);
+                            if is_tracked(rel) {
+                                paths.insert(rel.to_string_lossy().replace('\\', "/"));
                             }
                         }
                     }
@@ -51,9 +59,8 @@ pub fn watch_loop<F: FnMut(Vec<String>)>(root: &Path, mut on_event: F) -> Result
         if let Ok(Ok(event)) = &first {
             for p in &event.paths {
                 if let Ok(rel) = p.strip_prefix(root) {
-                    let s = rel.to_string_lossy().replace('\\', "/");
-                    if !s.starts_with(FABRIC_DIR) && !s.starts_with(".git") {
-                        paths.insert(s);
+                    if is_tracked(rel) {
+                        paths.insert(rel.to_string_lossy().replace('\\', "/"));
                     }
                 }
             }
