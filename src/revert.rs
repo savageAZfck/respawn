@@ -156,7 +156,13 @@ pub fn apply(
     // removable entries — a link the manifest doesn't know about gets
     // unlinked (the link itself, never its target).
     for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("respawn: skipping unreadable entry: {e}");
+                continue;
+            }
+        };
         let ft = entry.file_type();
         if !ft.is_file() && !ft.is_symlink() {
             continue;

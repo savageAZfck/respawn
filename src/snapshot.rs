@@ -188,7 +188,15 @@ pub fn create(store: &Store, root: &Path, message: &str) -> Result<Hash> {
     let mut files = Vec::new();
 
     for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
-        let entry = entry?;
+        // Skip unreadable entries (e.g. root-owned dirs) rather than
+        // aborting the whole snapshot — a daily agent must be resilient.
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("respawn: skipping unreadable entry: {e}");
+                continue;
+            }
+        };
         if !entry.file_type().is_file() {
             continue;
         }
