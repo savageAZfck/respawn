@@ -84,13 +84,17 @@ respawn pull host:4789 --psk <secret>   # replicate a peer's history
 - **Revert is O(changed files), not O(1).** The HEAD swap is constant-time;
   materializing content is proportional to what differs. For large trees
   the honest cost model is "pay for what changed."
-- **Anchors bind history, not the future.** An anchor proves the audit
-  prefix it signed is still present and unaltered. It cannot prove
-  entries *after* the anchor are honest, and it only travels as far as
-  you take the file — an anchor nobody copies off the machine protects
-  nothing. The signing key lives at `.respawn/anchor.secret`; an attacker
-  with that file can forge anchors, which is why `verify --pubkey` pins
-  the signer you recorded at `keygen`.
+- **Anchors bind the past they signed — chain them to shrink the gap.**
+  Each anchor proves its covered audit prefix is intact and signs the
+  hash of the previous anchor file: verifying a series pairwise
+  (`anchor verify <n> --prev <n-1>`) detects a deleted, spliced, or
+  substituted anchor. What no anchor can prove is honesty *after* the
+  latest one — the unverifiable window is exactly "since last anchor,"
+  so anchor before anything risky and copy the files off the machine.
+  An anchor nobody keeps protects nothing. The signing key lives at
+  `.respawn/anchor.secret`; an attacker with that file can forge
+  anchors, which is why `verify --pubkey` pins the signer recorded at
+  `keygen`.
 - **Plaintext sync remains for compatibility.** Without `--psk` the wire
   is unencrypted and unauthenticated — integrity is still guaranteed by
   content hashes, confidentiality is not, and any reachable host can

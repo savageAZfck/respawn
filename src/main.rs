@@ -150,6 +150,10 @@ enum AnchorCmd {
         /// Pin the expected signer public key (hex)
         #[arg(long)]
         pubkey: Option<String>,
+        /// Also verify this anchor chains to PREV (the previous anchor
+        /// file) — apply pairwise over a stored series
+        #[arg(long)]
+        prev: Option<PathBuf>,
     },
 }
 
@@ -464,7 +468,7 @@ fn run() -> Result<i32> {
                     );
                     println!("keep it outside .respawn/ — an anchor inside the thing it anchors proves nothing");
                 }
-                AnchorCmd::Verify { file, pubkey } => {
+                AnchorCmd::Verify { file, pubkey, prev } => {
                     let out = anchor::verify(&store, &file, pubkey.as_deref())?;
                     println!("anchor valid — signed by {}", out.signer_pubkey);
                     println!("anchored audit prefix: {} entries intact", out.audit_len);
@@ -475,6 +479,22 @@ fn run() -> Result<i32> {
                             a.unwrap_or_else(|| "none".into()),
                             c.unwrap_or_else(|| "none".into())
                         ),
+                    }
+                    match (&out.prev_anchor, &prev) {
+                        (None, None) => println!("chain link: none (first anchor)"),
+                        (Some(h), None) => println!(
+                            "chain link: anchors to {} (pass --prev <file> to check it)",
+                            &h[..12]
+                        ),
+                        (None, Some(_)) => {
+                            return Err(Error::Corrupt(
+                                "--prev given but anchor has no chain link".into(),
+                            ));
+                        }
+                        (Some(_), Some(p)) => {
+                            anchor::verify_link(&file, p)?;
+                            println!("chain link verified against {}", p.display());
+                        }
                     }
                 }
             }

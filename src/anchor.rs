@@ -24,6 +24,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const SECRET_FILE: &str = "anchor.secret";
 const FABRIC_ID_FILE: &str = "fabric_id";
+/// BLAKE3 hex of the most recently minted anchor file — the link the
+/// next anchor signs. Anchors form a chain: verify pairwise and a
+/// deleted, spliced, or substituted anchor file breaks the sequence.
+const LAST_ANCHOR_FILE: &str = "last_anchor";
 const ANCHOR_VERSION: u32 = 1;
 
 /// Canonical signed statement. Serialized into `payload` inside the
@@ -41,6 +45,12 @@ struct AnchorPayload {
     audit_tip: String,
     /// HEAD snapshot at anchor time (hex), or null.
     head: Option<String>,
+    /// BLAKE3 of the previous anchor *file* (the whole signed document,
+    /// signature included). None on the first anchor, and absent in
+    /// anchors written before chaining existed — `serde(default)` keeps
+    /// those readable.
+    #[serde(default)]
+    prev_anchor: Option<String>,
     ts: u64,
 }
 
@@ -192,6 +202,14 @@ pub fn create(store: &Store, out: &Path) -> Result<u64> {
     }
     let sk = load_key(store)?;
     let (audit_len, audit_tip) = audit::tip(store)?;
+    // Chain link: this anchor signs the hash of the previous anchor
+    // file. last_anchor is a convenience marker — its value is checked
+    // against the signed payload at verify-link time, so tampering with
+    // the marker only ever desynchronizes, never forges.
+    let prev_anchor = match fs::read_to_string(store.fabric_dir().join(LAST_ANCHOR_FILE)) {
+        Ok(s) => Some(s.trim().to_string()),
+        Err(_) => None,
+    };
     let payload = AnchorPayload {
         kind: "respawn-anchor".into(),
         version: ANCHOR_VERSION,
@@ -199,6 +217,7 @@ pub fn create(store: &Store, out: &Path) -> Result<u64> {
         audit_len,
         audit_tip,
         head: store.head()?.map(hex::encode),
+        prev_anchor,
         ts: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -214,6 +233,10 @@ pub fn create(store: &Store, out: &Path) -> Result<u64> {
     };
     let bytes = serde_json::to_vec_pretty(&file)?;
     atomic_write(out, &bytes)?;
+    atomic_write(
+        &store.fabric_dir().join(LAST_ANCHOR_FILE),
+        hex::encode(crate::hash_bytes(&bytes)).as_bytes(),
+    )?;
     Ok(payload.audit_len)
 }
 
@@ -226,6 +249,11 @@ pub struct VerifyOutcome {
     /// HEAD right now — divergence is normal (new snapshots), reported
     /// for visibility, not treated as tampering.
     pub current_head: Option<String>,
+    /// BLAKE3 hex of the anchor file itself — the link the next anchor
+    /// in the chain should carry.
+    pub file_hash: String,
+    /// Hash of the previous anchor this one chains to, if any.
+    pub prev_anchor: Option<String>,
 }
 
 /// Anchors are tiny JSON; a cap rejects memory-exhaustion inputs before
@@ -243,13 +271,12 @@ fn read_anchor_file(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).map_err(Error::Io)
 }
 
-/// Verify an anchor file: signature over the payload, signer identity
-/// (optionally pinned via `expected_pubkey`), fabric id match, and —
-/// the actual point — that the anchored audit tip is still a valid
-/// prefix of the live log.
-pub fn verify(store: &Store, path: &Path, expected_pubkey: Option<&str>) -> Result<VerifyOutcome> {
-    let bytes = read_anchor_file(path)?;
-    let file: AnchorFile = serde_json::from_slice(&bytes)
+/// Parse an anchor file and verify its signature: format check, key
+/// and signature decoding, ed25519 verify over the payload string.
+/// Returns the file and its decoded payload — the shared front half of
+/// every verification entry point.
+fn checked_anchor(bytes: &[u8]) -> Result<(AnchorFile, AnchorPayload)> {
+    let file: AnchorFile = serde_json::from_slice(bytes)
         .map_err(|e| Error::Corrupt(format!("anchor file unparsable: {e}")))?;
     if file.format != "respawn-anchor/v1" {
         return Err(Error::Corrupt(format!(
@@ -257,7 +284,6 @@ pub fn verify(store: &Store, path: &Path, expected_pubkey: Option<&str>) -> Resu
             file.format
         )));
     }
-
     let pk_raw =
         hex::decode(&file.pubkey).map_err(|_| Error::Corrupt("anchor pubkey is not hex".into()))?;
     let pk_raw: [u8; 32] = pk_raw
@@ -275,6 +301,24 @@ pub fn verify(store: &Store, path: &Path, expected_pubkey: Option<&str>) -> Resu
     vk.verify(file.payload.as_bytes(), &sig)
         .map_err(|_| Error::Corrupt("anchor signature invalid".into()))?;
 
+    let payload: AnchorPayload = serde_json::from_str(&file.payload)
+        .map_err(|e| Error::Corrupt(format!("anchor payload unparsable: {e}")))?;
+    if payload.kind != "respawn-anchor" || payload.version != ANCHOR_VERSION {
+        return Err(Error::Corrupt(
+            "anchor payload version/type mismatch".into(),
+        ));
+    }
+    Ok((file, payload))
+}
+
+/// Verify an anchor file: signature over the payload, signer identity
+/// (optionally pinned via `expected_pubkey`), fabric id match, and —
+/// the actual point — that the anchored audit tip is still a valid
+/// prefix of the live log.
+pub fn verify(store: &Store, path: &Path, expected_pubkey: Option<&str>) -> Result<VerifyOutcome> {
+    let bytes = read_anchor_file(path)?;
+    let (file, payload) = checked_anchor(&bytes)?;
+
     if let Some(want) = expected_pubkey {
         if !want.eq_ignore_ascii_case(&file.pubkey) {
             return Err(Error::Corrupt(format!(
@@ -284,13 +328,6 @@ pub fn verify(store: &Store, path: &Path, expected_pubkey: Option<&str>) -> Resu
         }
     }
 
-    let payload: AnchorPayload = serde_json::from_str(&file.payload)
-        .map_err(|e| Error::Corrupt(format!("anchor payload unparsable: {e}")))?;
-    if payload.kind != "respawn-anchor" || payload.version != ANCHOR_VERSION {
-        return Err(Error::Corrupt(
-            "anchor payload version/type mismatch".into(),
-        ));
-    }
     if payload.fabric_id != fabric_id(store)? {
         return Err(Error::Corrupt(
             "anchor belongs to a different fabric".into(),
@@ -308,30 +345,41 @@ pub fn verify(store: &Store, path: &Path, expected_pubkey: Option<&str>) -> Resu
         audit_len: payload.audit_len,
         anchored_head: payload.head,
         current_head,
+        file_hash: hex::encode(crate::hash_bytes(&bytes)),
+        prev_anchor: payload.prev_anchor,
     })
+}
+
+/// Verify that `cur` chains to `prev`: both must be well-formed signed
+/// anchors, and `cur`'s signed `prev_anchor` must equal the BLAKE3 of
+/// `prev`'s exact bytes. Pairwise application over a stored anchor
+/// series proves the *sequence* was not spliced, substituted, or had
+/// members deleted — shrinking the unverifiable window to "since the
+/// last anchor" instead of "since anchoring began."
+pub fn verify_link(cur: &Path, prev: &Path) -> Result<()> {
+    let prev_bytes = read_anchor_file(prev)?;
+    let prev_hash = hex::encode(crate::hash_bytes(&prev_bytes));
+    // prev must itself be a valid signed anchor — a link into garbage
+    // is not a link.
+    checked_anchor(&prev_bytes)?;
+
+    let cur_bytes = read_anchor_file(cur)?;
+    let (_file, payload) = checked_anchor(&cur_bytes)?;
+    match &payload.prev_anchor {
+        Some(h) if h == &prev_hash => Ok(()),
+        Some(_) => Err(Error::Corrupt(
+            "anchor does not chain to the given predecessor".into(),
+        )),
+        None => Err(Error::Corrupt(
+            "anchor has no chain link (first anchor, or pre-chain format)".into(),
+        )),
+    }
 }
 
 /// Sanity: the file reads and its signature verifies without touching a
 /// fabric — used when checking an anchor away from its worktree.
 pub fn verify_detached(path: &Path) -> Result<String> {
     let bytes = read_anchor_file(path)?;
-    let file: AnchorFile = serde_json::from_slice(&bytes)
-        .map_err(|e| Error::Corrupt(format!("anchor file unparsable: {e}")))?;
-    let pk_raw =
-        hex::decode(&file.pubkey).map_err(|_| Error::Corrupt("anchor pubkey is not hex".into()))?;
-    let pk_raw: [u8; 32] = pk_raw
-        .try_into()
-        .map_err(|_| Error::Corrupt("anchor pubkey is not 32 bytes".into()))?;
-    let vk = VerifyingKey::from_bytes(&pk_raw)
-        .map_err(|_| Error::Corrupt("anchor pubkey invalid".into()))?;
-    let sig_raw =
-        hex::decode(&file.sig).map_err(|_| Error::Corrupt("anchor sig is not hex".into()))?;
-    let sig_raw: [u8; 64] = sig_raw
-        .try_into()
-        .map_err(|_| Error::Corrupt("anchor sig is not 64 bytes".into()))?;
-    let sig = Signature::from_bytes(&sig_raw);
-    use ed25519_dalek::Verifier;
-    vk.verify(file.payload.as_bytes(), &sig)
-        .map_err(|_| Error::Corrupt("anchor signature invalid".into()))?;
+    let (file, _payload) = checked_anchor(&bytes)?;
     Ok(file.pubkey)
 }

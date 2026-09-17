@@ -272,6 +272,59 @@ fn anchor_refuses_to_live_inside_fabric() {
 }
 
 #[test]
+fn anchor_chain_links_and_detects_splice() {
+    let t = fixture();
+    let root = t.path();
+    let store = Store::open(root).unwrap();
+    anchor::keygen(&store).unwrap();
+    let outside = TempDir::new().unwrap();
+
+    audit::record(&store, "e1", "a").unwrap();
+    let a1 = outside.path().join("a1.json");
+    anchor::create(&store, &a1).unwrap();
+
+    audit::record(&store, "e2", "b").unwrap();
+    let a2 = outside.path().join("a2.json");
+    anchor::create(&store, &a2).unwrap();
+
+    audit::record(&store, "e3", "c").unwrap();
+    let a3 = outside.path().join("a3.json");
+    anchor::create(&store, &a3).unwrap();
+
+    // Correct pairwise links verify.
+    anchor::verify_link(&a2, &a1).unwrap();
+    anchor::verify_link(&a3, &a2).unwrap();
+
+    // Skipping a link (a3 -> a1) must fail — a missing middle anchor
+    // is exactly the splice detection the chain exists for.
+    assert!(anchor::verify_link(&a3, &a1).is_err());
+
+    // A tampered predecessor file breaks the link — the hash covers
+    // the whole signed document, not just the payload.
+    let tampered = outside.path().join("a1-tampered.json");
+    let mut bytes = fs::read(&a1).unwrap();
+    let n = bytes.len();
+    bytes[n - 3] ^= 1;
+    fs::write(&tampered, bytes).unwrap();
+    assert!(anchor::verify_link(&a2, &tampered).is_err());
+}
+
+#[test]
+fn first_anchor_has_no_link_and_verify_reports_it() {
+    let t = fixture();
+    let root = t.path();
+    let store = Store::open(root).unwrap();
+    anchor::keygen(&store).unwrap();
+    audit::record(&store, "x", "y").unwrap();
+    let outside = TempDir::new().unwrap();
+    let a = outside.path().join("a.json");
+    anchor::create(&store, &a).unwrap();
+    let out = anchor::verify(&store, &a, None).unwrap();
+    assert!(out.prev_anchor.is_none());
+    assert_eq!(out.file_hash.len(), 64);
+}
+
+#[test]
 fn anchor_rejects_foreign_fabric() {
     let t1 = fixture();
     let store1 = Store::open(t1.path()).unwrap();
