@@ -369,10 +369,16 @@ pub fn verify_link(cur: &Path, prev: &Path) -> Result<()> {
     }
 }
 
+/// Sanity: the bytes parse and their signature verifies without
+/// touching a fabric — used when checking an anchor away from its
+/// worktree.
+pub fn verify_detached_bytes(bytes: &[u8]) -> Result<String> {
+    let (file, _payload) = checked_anchor(bytes)?;
+    Ok(file.pubkey)
+}
+
 /// Sanity: the file reads and its signature verifies without touching a
 /// fabric — used when checking an anchor away from its worktree.
 pub fn verify_detached(path: &Path) -> Result<String> {
-    let bytes = read_anchor_file(path)?;
-    let (file, _payload) = checked_anchor(&bytes)?;
-    Ok(file.pubkey)
+    verify_detached_bytes(&read_anchor_file(path)?)
 }

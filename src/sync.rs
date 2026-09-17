@@ -64,7 +64,10 @@ fn frame_payload(frame: &[u8]) -> Result<&[u8]> {
     Ok(&frame[8..8 + len])
 }
 
-fn respond(io: &mut FrameIo, store: &Store, frame: &[u8]) -> Result<()> {
+/// The pure half of `respond`: a request frame in, response bytes out.
+/// Kept IO-free so the wire parser can be fuzzed directly.
+#[doc(hidden)]
+pub fn respond_frame(store: &Store, frame: &[u8]) -> Result<Vec<u8>> {
     match frame.first().copied() {
         Some(OP_GET_HEAD) => {
             let head = store.head()?;
@@ -72,7 +75,7 @@ fn respond(io: &mut FrameIo, store: &Store, frame: &[u8]) -> Result<()> {
             if let Some(h) = head {
                 out.extend_from_slice(&h);
             }
-            io.write_frame(&out)?;
+            Ok(out)
         }
         Some(OP_GET_MANIFEST) if frame.len() == 33 => {
             let h: Hash = frame[1..].try_into().unwrap();
@@ -83,7 +86,7 @@ fn respond(io: &mut FrameIo, store: &Store, frame: &[u8]) -> Result<()> {
             };
             let mut out = (data.len() as u64).to_le_bytes().to_vec();
             out.extend_from_slice(&data);
-            io.write_frame(&out)?;
+            Ok(out)
         }
         Some(OP_HAVE) if frame.len() >= 5 => {
             let n = u32::from_le_bytes(frame[1..5].try_into().unwrap()) as usize;
@@ -95,18 +98,22 @@ fn respond(io: &mut FrameIo, store: &Store, frame: &[u8]) -> Result<()> {
                 let h: Hash = frame[5 + i * 32..5 + (i + 1) * 32].try_into().unwrap();
                 out.push(if store.has_object(&h) { 1u8 } else { 0u8 });
             }
-            io.write_frame(&out)?;
+            Ok(out)
         }
         Some(OP_GET_OBJECT) if frame.len() == 33 => {
             let h: Hash = frame[1..].try_into().unwrap();
             let data = store.get_object(&h).unwrap_or_default();
             let mut out = (data.len() as u64).to_le_bytes().to_vec();
             out.extend_from_slice(&data);
-            io.write_frame(&out)?;
+            Ok(out)
         }
-        _ => return Err(Error::Sync("unknown opcode".into())),
+        _ => Err(Error::Sync("unknown opcode".into())),
     }
-    Ok(())
+}
+
+fn respond(io: &mut FrameIo, store: &Store, frame: &[u8]) -> Result<()> {
+    let out = respond_frame(store, frame)?;
+    io.write_frame(&out)
 }
 
 /// Per-connection entry: sniff the protocol selector, then run the

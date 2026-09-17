@@ -1,0 +1,57 @@
+[package]
+name = "respawn-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.respawn]
+path = ".."
+
+
+[[bin]]
+name = "fuzz_anchor"
+path = "fuzz_targets/fuzz_anchor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_manifest"
+path = "fuzz_targets/fuzz_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_frame"
+path = "fuzz_targets/fuzz_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_audit"
+path = "fuzz_targets/fuzz_audit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_cdc"
+path = "fuzz_targets/fuzz_cdc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_object"
+path = "fuzz_targets/fuzz_object.rs"
+test = false
+doc = false
+bench = false
