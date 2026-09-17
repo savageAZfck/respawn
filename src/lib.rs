@@ -6,13 +6,16 @@
 //! replication between peers over the LAN. Every mutation is recorded in a
 //! hash-chained audit log.
 
+pub mod admin;
 pub mod anchor;
 pub mod apfs;
 pub mod audit;
 pub mod cdc;
 pub mod drift;
 pub mod guard;
+pub mod keychain;
 pub mod revert;
+pub mod schedule;
 pub mod secure;
 pub mod snapshot;
 pub mod store;

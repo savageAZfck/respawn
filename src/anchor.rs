@@ -10,19 +10,20 @@
 //! anchored tip is still a valid prefix of the live log, which catches
 //! truncation, splicing, and wholesale replacement.
 //!
-//! The signing key lives at `.respawn/anchor.secret` (mode 0600). The
-//! pubkey is printed once at `anchor keygen` — record it. `verify`
-//! checks the signer identity so a swapped key produces a swapped key,
-//! not a passed check.
+//! The signing key lives in the login Keychain on macOS, falling back
+//! to `.respawn/anchor.secret` (mode 0600) elsewhere or in sessions
+//! where the Keychain is unreachable — see `keychain.rs`. The pubkey
+//! is printed once at `anchor keygen` — record it. `verify` checks the
+//! signer identity so a swapped key produces a swapped key, not a
+//! passed check.
 
-use crate::{audit, Error, Result, Store};
+use crate::{audit, keychain, Error, Result, Store};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SECRET_FILE: &str = "anchor.secret";
 const FABRIC_ID_FILE: &str = "fabric_id";
 /// BLAKE3 hex of the most recently minted anchor file — the link the
 /// next anchor signs. Anchors form a chain: verify pairwise and a
@@ -60,10 +61,6 @@ struct AnchorFile {
     pubkey: String,
     payload: String,
     sig: String,
-}
-
-fn secret_path(store: &Store) -> PathBuf {
-    store.fabric_dir().join(SECRET_FILE)
 }
 
 fn fabric_id_path(store: &Store) -> PathBuf {
@@ -109,81 +106,46 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Write the signing key atomically AND with mode 0600 from birth —
-/// a create-then-chmod sequence leaves a window where the key file is
-/// readable to other users on the machine.
-#[cfg(unix)]
-fn write_secret(path: &Path, data: &[u8]) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(dir)?;
-    let tmp = crate::tmp_path(dir, "secret");
-    {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        std::io::Write::write_all(&mut f, data)?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_secret(path: &Path, data: &[u8]) -> Result<()> {
-    atomic_write(path, data)
-}
-
 /// Generate the anchor signing key. Refuses to overwrite — a swapped
 /// key is indistinguishable from an attacker swapping keys unless the
 /// original pubkey was recorded off-fabric, so clobbering is never
-/// done silently.
-pub fn keygen(store: &Store) -> Result<String> {
-    let path = secret_path(store);
-    if path.exists() {
-        return Err(Error::Corrupt(format!(
-            "anchor key already exists at {}",
-            path.display()
-        )));
+/// done silently. Returns the pubkey and an optional operator note
+/// (e.g. a Keychain-unavailable fallback).
+pub fn keygen(store: &Store) -> Result<(String, Option<String>)> {
+    if keychain::exists(store) {
+        return Err(Error::Corrupt("anchor key already exists".into()));
     }
     let mut raw = [0u8; 32];
     getrandom::getrandom(&mut raw).map_err(|e| Error::Io(std::io::Error::other(e)))?;
     let sk = SigningKey::from_bytes(&raw);
-    write_secret(&path, hex::encode(raw).as_bytes())?;
     let _ = fabric_id(store)?; // ensure the identity exists alongside the key
-    Ok(hex::encode(sk.verifying_key().as_bytes()))
+    let (_placement, note) = keychain::put(store, &raw)?;
+    Ok((hex::encode(sk.verifying_key().as_bytes()), note))
 }
 
-fn load_key(store: &Store) -> Result<SigningKey> {
-    let path = secret_path(store);
-    let s = fs::read_to_string(&path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            Error::Corrupt("no anchor key — run `respawn anchor keygen`".into())
-        } else {
-            Error::Io(e)
-        }
-    })?;
-    let raw =
-        hex::decode(s.trim()).map_err(|_| Error::Corrupt("anchor secret is not hex".into()))?;
-    let raw: [u8; 32] = raw
-        .try_into()
-        .map_err(|_| Error::Corrupt("anchor secret is not 32 bytes".into()))?;
-    Ok(SigningKey::from_bytes(&raw))
+fn load_key(store: &Store) -> Result<(SigningKey, Option<String>)> {
+    let (raw, _placement, note) = keychain::get(store)?;
+    Ok((SigningKey::from_bytes(&raw), note))
 }
 
 /// The current public key, if a key exists.
 pub fn pubkey(store: &Store) -> Result<String> {
-    let sk = load_key(store)?;
+    let (sk, _) = load_key(store)?;
     Ok(hex::encode(sk.verifying_key().as_bytes()))
+}
+
+/// What `create`/`next` did: the covered audit count plus any
+/// operator note the secret layer produced (migration, fallback).
+#[derive(Debug)]
+pub struct CreateOutcome {
+    pub audit_len: u64,
+    pub note: Option<String>,
 }
 
 /// Sign a checkpoint of current fabric state and write it to `out`.
 /// `out` should live outside `.respawn/` — an anchor inside the thing
-/// it anchors can be replaced alongside it. Returns the number of
-/// audit entries the anchor covers.
-pub fn create(store: &Store, out: &Path) -> Result<u64> {
+/// it anchors can be replaced alongside it.
+pub fn create(store: &Store, out: &Path) -> Result<CreateOutcome> {
     // An anchor inside the fabric it anchors can be replaced alongside
     // the log it claims to prove — refuse the footgun outright. The file
     // may not exist yet, so canonicalize the parent, not the path.
@@ -200,7 +162,7 @@ pub fn create(store: &Store, out: &Path) -> Result<u64> {
             ));
         }
     }
-    let sk = load_key(store)?;
+    let (sk, note) = load_key(store)?;
     let (audit_len, audit_tip) = audit::tip(store)?;
     // Chain link: this anchor signs the hash of the previous anchor
     // file. last_anchor is a convenience marker — its value is checked
@@ -237,7 +199,38 @@ pub fn create(store: &Store, out: &Path) -> Result<u64> {
         &store.fabric_dir().join(LAST_ANCHOR_FILE),
         hex::encode(crate::hash_bytes(&bytes)).as_bytes(),
     )?;
-    Ok(payload.audit_len)
+    Ok(CreateOutcome {
+        audit_len: payload.audit_len,
+        note,
+    })
+}
+
+/// Mint the next chained anchor in `dir` under a timestamped name —
+/// `anchor-<unix-millis>.json`, with a `-N` suffix if the same
+/// millisecond is claimed twice. This is what `anchor schedule`'s
+/// LaunchAgent invokes: the name scheme keeps a stored series ordered
+/// and traversable for pairwise chain verification.
+pub fn next(store: &Store, dir: &Path) -> Result<(PathBuf, CreateOutcome)> {
+    fs::create_dir_all(dir)?;
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    for n in 0u32..1000 {
+        let name = if n == 0 {
+            format!("anchor-{millis}.json")
+        } else {
+            format!("anchor-{millis}-{n}.json")
+        };
+        let path = dir.join(&name);
+        if !path.exists() {
+            let out = create(store, &path)?;
+            return Ok((path, out));
+        }
+    }
+    Err(Error::Corrupt(
+        "could not allocate a timestamped anchor name".into(),
+    ))
 }
 
 #[derive(Debug)]

@@ -17,7 +17,7 @@ touches it, revert when it goes wrong, and prove afterward what changed.
 ```
 respawn init            # create .respawn/ in the worktree
 respawn snap -m "v1"    # content-addressed snapshot
-respawn snap --apfs     # true point-in-time cut via APFS (macOS, root)
+respawn snap --apfs     # point-in-time cut via APFS (macOS ≤15, root or --ask-admin)
 respawn status          # drift vs HEAD (added/modified/deleted)
 respawn status --full   # rehash every file — don't trust metadata
 respawn diff v1 head    # compare two snapshots
@@ -30,6 +30,8 @@ respawn guard --revert on-fail -- <cmd>   # undo the command's writes if it fail
 respawn anchor keygen           # mint the checkpoint signing key (once)
 respawn anchor create <file>    # sign HEAD+audit state → file outside .respawn/
 respawn anchor verify <file>    # prove the anchored history is intact
+respawn anchor next <dir>       # timestamped chained anchor (what the agent runs)
+respawn anchor schedule         # launchd agent: chained anchor every 5 min
 
 respawn serve --psk <secret>            # encrypted, authenticated LAN serve
 respawn serve --announce                # plaintext serve + UDP beacon
@@ -91,10 +93,18 @@ respawn pull host:4789 --psk <secret>   # replicate a peer's history
   substituted anchor. What no anchor can prove is honesty *after* the
   latest one — the unverifiable window is exactly "since last anchor,"
   so anchor before anything risky and copy the files off the machine.
-  An anchor nobody keeps protects nothing. The signing key lives at
-  `.respawn/anchor.secret`; an attacker with that file can forge
-  anchors, which is why `verify --pubkey` pins the signer recorded at
-  `keygen`.
+  An anchor nobody keeps protects nothing. `anchor schedule` installs a
+  launchd agent that mints a chained anchor every `--every` seconds,
+  shrinking the window automatically (agent log under
+  `~/Library/Logs/respawn/`; `schedule --uninstall` removes it).
+  The signing key lives in the login Keychain on macOS (service
+  `com.respawn.anchor`, account = fabric id), falling back to
+  `.respawn/anchor.secret` (0600) elsewhere or in sessions where the
+  Keychain is unreachable — set `RESPAWN_NO_KEYCHAIN=1` to force the
+  file. An attacker with the key can forge anchors, which is why
+  `verify --pubkey` pins the signer recorded at `keygen`. A locked
+  Keychain means the agent's anchor fails — the file fallback exists
+  for exactly that case.
 - **Plaintext sync remains for compatibility.** Without `--psk` the wire
   is unencrypted and unauthenticated — integrity is still guaranteed by
   content hashes, confidentiality is not, and any reachable host can
@@ -111,8 +121,15 @@ respawn pull host:4789 --psk <secret>   # replicate a peer's history
   `unstable` list rather than silently trusted. That shrinks the window
   to a single file read; it is not a whole-tree cut. `snap --apfs`
   freezes the volume at the filesystem layer for a true point-in-time
-  capture, but needs macOS + APFS + root for `mount_apfs`, and only
-  covers the boot volume. On anything else, snapshot quiesced trees.
+  capture (tmutil snapshot → mount_apfs → scan → delete), and
+  `--ask-admin` gets the required root through a GUI prompt instead of
+  sudo — the privileged child chowns `.respawn/` back afterward.
+  Honest boundary: since macOS 26 the kernel refuses to mount
+  snapshots of the boot Data volume even for root (a mounted Data
+  snapshot would bypass TCC), so `--apfs` reports that refusal rather
+  than pretend; it still works on older macOS. Only the boot volume
+  group is covered — tmutil snapshots nothing else. On anything else,
+  snapshot quiesced trees.
 - **Content-defined chunking is not alignment-stable.** CDC dedups
   inserts well, but chunk boundaries are content-derived — byte-identical
   files always chunk identically, near-identical ones mostly do. No
@@ -132,7 +149,9 @@ worktree/
     audit.jsonl               hash-chained event log
     lock                      flock'd during mutations — single writer
     fabric_id                 random fabric identity, bound into anchors
-    anchor.secret             ed25519 anchor key (0600) — sign checkpoints
+    anchor.secret             ed25519 anchor key (0600) — fallback when the
+                              macOS Keychain is unavailable/disabled
+    last_anchor               hash of the newest anchor file — the chain link
     remotes/<peer>            last-pulled remote heads
 ```
 

@@ -2,7 +2,7 @@
 //! secured sync, and content-defined chunking.
 
 use respawn::snapshot::Manifest;
-use respawn::{anchor, audit, cdc, guard, snapshot, sync, Error, Store};
+use respawn::{admin, anchor, audit, cdc, guard, schedule, snapshot, sync, Error, Store};
 use std::fs;
 use std::net::TcpListener;
 use std::path::Path;
@@ -16,6 +16,8 @@ fn write(root: &Path, rel: &str, data: &[u8]) {
 }
 
 fn fixture() -> TempDir {
+    // Tests must never write real Keychain items or trip ACL prompts.
+    std::env::set_var("RESPAWN_NO_KEYCHAIN", "1");
     let t = TempDir::new().unwrap();
     let root = t.path();
     Store::init(root).unwrap();
@@ -212,7 +214,7 @@ fn anchor_roundtrip_and_append_tolerance() {
     let t = fixture();
     let root = t.path();
     let store = Store::open(root).unwrap();
-    let pubkey = anchor::keygen(&store).unwrap();
+    let pubkey = anchor::keygen(&store).unwrap().0;
     snapshot::create(&store, root, "s1").unwrap();
     audit::record(&store, "snap", "x").unwrap();
 
@@ -571,4 +573,113 @@ fn apfs_snapshot_if_privileged() {
         }
         Err(e) => eprintln!("apfs unavailable in this environment: {e}"),
     }
+}
+
+// ---------- macOS platform layer ----------
+
+#[test]
+fn anchor_next_names_monotonic_and_chains() {
+    let t = fixture();
+    let store = Store::open(t.path()).unwrap();
+    anchor::keygen(&store).unwrap();
+    let dir = TempDir::new().unwrap();
+
+    let (p1, _) = anchor::next(&store, dir.path()).unwrap();
+    audit::record(&store, "x", "y").unwrap();
+    let (p2, _) = anchor::next(&store, dir.path()).unwrap();
+
+    assert_ne!(p1, p2);
+    assert!(p1
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("anchor-"));
+    anchor::verify_link(&p2, &p1).unwrap();
+}
+
+#[test]
+fn keychain_disabled_writes_0600_file() {
+    let t = fixture();
+    let store = Store::open(t.path()).unwrap();
+    anchor::keygen(&store).unwrap();
+    let p = t.path().join(".respawn/anchor.secret");
+    assert!(p.exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(p.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    }
+}
+
+#[test]
+fn schedule_validation_refuses_bad_specs() {
+    let t = fixture();
+    let store = Store::open(t.path()).unwrap();
+    // Below the minimum interval.
+    assert!(schedule::plan(&store, t.path(), None, 10).is_err());
+    // No signing key — the agent would fail every interval.
+    assert!(schedule::plan(&store, t.path(), None, 300).is_err());
+    anchor::keygen(&store).unwrap();
+    // Anchor dir inside the fabric defeats the point.
+    assert!(schedule::plan(
+        &store,
+        t.path(),
+        Some(t.path().join(".respawn/anchors")),
+        300
+    )
+    .is_err());
+}
+
+#[test]
+fn schedule_plist_escapes_and_lints() {
+    let t = fixture();
+    let store = Store::open(t.path()).unwrap();
+    anchor::keygen(&store).unwrap();
+    // XML-hostile directory name: metachars must not reach the plist raw.
+    let dir = t.path().join("a & <b> \"c\".anchors");
+    let spec = schedule::plan(&store, t.path(), Some(dir), 300).unwrap();
+    let xml = schedule::plist_xml(&spec);
+    assert!(xml.contains("<key>StartInterval</key>"));
+    assert!(xml.contains("<integer>300</integer>"));
+    assert!(xml.contains("<key>RunAtLoad</key>"));
+    assert!(xml.contains("a &amp; &lt;b&gt; &quot;c&quot;.anchors"));
+    assert!(!xml.contains("<b>"), "raw XML injection into plist");
+
+    #[cfg(target_os = "macos")]
+    {
+        // The real validator — launchd's own parser.
+        let tmp = t.path().join("spec.plist");
+        fs::write(&tmp, &xml).unwrap();
+        let out = std::process::Command::new("plutil")
+            .arg("-lint")
+            .arg(&tmp)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "plutil rejected generated plist: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sh_quote_survives_real_shell() {
+    // The proof, not the assertion: pipe a hostile string through
+    // /bin/sh and require it back byte-for-byte.
+    let hostile = "x'y $HOME `id` $(echo PWNED) \"q\" \\z";
+    let out = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("printf '%s' {}", admin::sh_quote(hostile)))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), hostile);
+}
+
+#[test]
+fn admin_escapes_cover_metachars() {
+    assert_eq!(admin::sh_quote("it's"), r"'it'\''s'");
+    assert_eq!(admin::as_escape("a\\b\"c"), "a\\\\b\\\"c");
 }

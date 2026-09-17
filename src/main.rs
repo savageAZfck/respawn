@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use respawn::snapshot;
-use respawn::{anchor, apfs, audit, drift, guard, revert, sync, watch, Error, Result, Store};
+use respawn::{
+    admin, anchor, apfs, audit, drift, guard, revert, schedule, sync, watch, Error, Result, Store,
+};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -30,6 +32,10 @@ enum Cmd {
         /// (macOS, requires root for mount_apfs)
         #[arg(long)]
         apfs: bool,
+        /// Ask for admin authorization via the macOS GUI prompt
+        /// instead of requiring sudo (only with --apfs)
+        #[arg(long, requires = "apfs")]
+        ask_admin: bool,
     },
     /// List snapshots, newest first
     Log {
@@ -143,6 +149,27 @@ enum AnchorCmd {
         /// Where the anchor file goes — should live outside .respawn/
         file: PathBuf,
     },
+    /// Write the next chained anchor into DIR under a timestamped
+    /// name — what `anchor schedule`'s LaunchAgent invokes
+    Next {
+        /// Anchor directory (default: per-fabric dir under
+        /// ~/Library/Application Support/respawn on macOS)
+        dir: Option<PathBuf>,
+    },
+    /// Install (or --uninstall) a launchd agent that mints a chained
+    /// anchor every N seconds — shrinks the unverifiable tail
+    Schedule {
+        /// Seconds between anchors (min 60)
+        #[arg(long, default_value = "300")]
+        every: u64,
+        /// Anchor directory (default: per-fabric dir under
+        /// ~/Library/Application Support/respawn)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Remove the scheduled agent
+        #[arg(long)]
+        uninstall: bool,
+    },
     /// Verify an anchor against the live fabric
     Verify {
         /// Anchor file to check
@@ -197,8 +224,19 @@ fn run() -> Result<i32> {
             audit::record(&store, "init", dir.to_string_lossy().as_ref())?;
             println!("initialized respawn in {}", dir.display());
         }
-        Cmd::Snap { message, apfs } => {
+        Cmd::Snap {
+            message,
+            apfs,
+            ask_admin,
+        } => {
             let (store, root) = open_store()?;
+            if ask_admin && !admin::is_root() {
+                // Re-exec this snapshot through the macOS admin
+                // prompt; the privileged child runs the ordinary
+                // --apfs path and chowns the fabric back to us.
+                let exe = std::env::current_exe()?.canonicalize()?;
+                return admin::snap_as_admin(&exe, &root, &store.fabric_dir(), &message).map(|_| 0);
+            }
             let _lock = store.try_lock()?;
             let id = if apfs {
                 // Frozen view: the ApfsSnap Drop unmounts and deletes
@@ -446,13 +484,16 @@ fn run() -> Result<i32> {
             return Ok(report.process_exit_code());
         }
         Cmd::Anchor { sub } => {
-            let (store, _) = open_store()?;
+            let (store, root) = open_store()?;
             match sub {
                 AnchorCmd::Keygen => {
                     let _lock = store.try_lock()?;
-                    let pk = anchor::keygen(&store)?;
+                    let (pk, note) = anchor::keygen(&store)?;
                     audit::record(&store, "anchor-keygen", &pk)?;
                     println!("anchor pubkey: {pk}");
+                    if let Some(n) = note {
+                        println!("note: {n}");
+                    }
                     println!("record it off-fabric — `anchor verify --pubkey` pins against it");
                 }
                 AnchorCmd::Pubkey => {
@@ -460,13 +501,54 @@ fn run() -> Result<i32> {
                 }
                 AnchorCmd::Create { file } => {
                     let _lock = store.try_lock()?;
-                    let covered = anchor::create(&store, &file)?;
+                    let out = anchor::create(&store, &file)?;
                     audit::record(&store, "anchor", &file.to_string_lossy())?;
                     println!(
-                        "anchor written to {} (audit entries: {covered})",
-                        file.display()
+                        "anchor written to {} (audit entries: {})",
+                        file.display(),
+                        out.audit_len
                     );
+                    if let Some(n) = out.note {
+                        println!("note: {n}");
+                    }
                     println!("keep it outside .respawn/ — an anchor inside the thing it anchors proves nothing");
+                }
+                AnchorCmd::Next { dir } => {
+                    let _lock = store.try_lock()?;
+                    let dir = match dir {
+                        Some(d) => d,
+                        None => schedule::default_anchor_dir(&anchor::fabric_id(&store)?)?,
+                    };
+                    let (path, out) = anchor::next(&store, &dir)?;
+                    audit::record(&store, "anchor", &path.to_string_lossy())?;
+                    println!(
+                        "anchor written to {} (audit entries: {})",
+                        path.display(),
+                        out.audit_len
+                    );
+                    if let Some(n) = out.note {
+                        println!("note: {n}");
+                    }
+                }
+                AnchorCmd::Schedule {
+                    every,
+                    dir,
+                    uninstall,
+                } => {
+                    if uninstall {
+                        let p = schedule::uninstall(&store)?;
+                        println!("removed scheduled anchor ({})", p.display());
+                    } else {
+                        let spec = schedule::plan(&store, &root, dir, every)?;
+                        schedule::install(&spec)?;
+                        println!(
+                            "scheduled {}: anchor every {}s → {}",
+                            spec.label,
+                            spec.every,
+                            spec.anchor_dir.display()
+                        );
+                        println!("agent log: {}", spec.log.display());
+                    }
                 }
                 AnchorCmd::Verify { file, pubkey, prev } => {
                     let out = anchor::verify(&store, &file, pubkey.as_deref())?;
