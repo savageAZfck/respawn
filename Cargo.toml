@@ -1,6 +1,6 @@
 [package]
 name = "respawn"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Versioned respawn: content-addressed snapshots, atomic revert, drift detection, LAN sync"
 license = "FSL-1.1-ALv2"
@@ -16,6 +16,11 @@ walkdir = "2.4"
 notify = "6.1"
 serde_json = "1.0"
 hex = "0.4"
+fs2 = "0.4"
+ed25519-dalek = "2"
+getrandom = "0.2"
+snow = "0.9"
+fastcdc = "3"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

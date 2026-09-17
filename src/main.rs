@@ -1,6 +1,6 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use respawn::snapshot;
-use respawn::{audit, drift, revert, sync, watch, Error, Result, Store};
+use respawn::{anchor, apfs, audit, drift, guard, revert, sync, watch, Error, Result, Store};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -26,6 +26,10 @@ enum Cmd {
         /// Snapshot message
         #[arg(short, long, default_value = "")]
         message: String,
+        /// Capture a true point-in-time cut via an APFS snapshot
+        /// (macOS, requires root for mount_apfs)
+        #[arg(long)]
+        apfs: bool,
     },
     /// List snapshots, newest first
     Log {
@@ -79,6 +83,10 @@ enum Cmd {
         /// Broadcast a UDP discovery beacon
         #[arg(long)]
         announce: bool,
+        /// Passphrase securing the transport (Noise NNpsk0). When set,
+        /// plaintext connections are refused outright.
+        #[arg(long)]
+        psk: Option<String>,
     },
     /// Discover announcing peers on the LAN
     Peers {
@@ -90,6 +98,58 @@ enum Cmd {
     Pull {
         /// Peer address, host:port
         addr: String,
+        /// Passphrase the peer's `serve` was started with
+        #[arg(long)]
+        psk: Option<String>,
+    },
+    /// Snapshot, run a command, report its drift, optionally revert.
+    /// Everything after `--` is the command.
+    Guard {
+        /// When to restore the pre-command snapshot
+        #[arg(long, value_enum, default_value = "never")]
+        revert: RevertArg,
+        /// Rehash every file for the drift report (don't trust mtime)
+        #[arg(long)]
+        full: bool,
+        /// Command to run under guard
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        cmd: Vec<String>,
+    },
+    /// Signed external checkpoints of fabric state
+    Anchor {
+        #[command(subcommand)]
+        sub: AnchorCmd,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum RevertArg {
+    /// Leave the tree as the command left it
+    Never,
+    /// Restore only if the command exited non-zero
+    OnFail,
+    /// Always restore (ephemeral run)
+    Always,
+}
+
+#[derive(Subcommand)]
+enum AnchorCmd {
+    /// Generate the anchor signing key (once — refuses to overwrite)
+    Keygen,
+    /// Print the anchor public key — record it off-fabric
+    Pubkey,
+    /// Sign a checkpoint of current state and write it to FILE
+    Create {
+        /// Where the anchor file goes — should live outside .respawn/
+        file: PathBuf,
+    },
+    /// Verify an anchor against the live fabric
+    Verify {
+        /// Anchor file to check
+        file: PathBuf,
+        /// Pin the expected signer public key (hex)
+        #[arg(long)]
+        pubkey: Option<String>,
     },
 }
 
@@ -123,7 +183,7 @@ fn print_drift(r: &drift::DriftReport) {
     );
 }
 
-fn run() -> Result<()> {
+fn run() -> Result<i32> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Init { dir } => {
@@ -133,9 +193,17 @@ fn run() -> Result<()> {
             audit::record(&store, "init", dir.to_string_lossy().as_ref())?;
             println!("initialized respawn in {}", dir.display());
         }
-        Cmd::Snap { message } => {
+        Cmd::Snap { message, apfs } => {
             let (store, root) = open_store()?;
-            let id = snapshot::create(&store, &root, &message)?;
+            let _lock = store.try_lock()?;
+            let id = if apfs {
+                // Frozen view: the ApfsSnap Drop unmounts and deletes
+                // the cut however create_from returns — success or not.
+                let frozen = apfs::create(&root)?;
+                snapshot::create_from(&store, frozen.scan_root(), &message)?
+            } else {
+                snapshot::create(&store, &root, &message)?
+            };
             audit::record(&store, "snap", &respawn::hash_hex(&id))?;
             println!("snapshot {}", respawn::hash_hex(&id));
         }
@@ -211,6 +279,7 @@ fn run() -> Result<()> {
             force,
         } => {
             let (store, root) = open_store()?;
+            let _lock = store.try_lock()?;
             let id = snapshot::resolve(&store, &id)?;
             let m = snapshot::load(&store, &id)?;
             let (drift_r, applied) =
@@ -295,29 +364,37 @@ fn run() -> Result<()> {
                 return Err(Error::Corrupt("audit chain invalid".into()));
             }
         }
-        Cmd::Serve { addr, announce } => {
+        Cmd::Serve {
+            addr,
+            announce,
+            psk,
+        } => {
             let (store, _) = open_store()?;
-            if !is_loopback(&addr) {
+            if !is_loopback(&addr) && psk.is_none() {
                 eprintln!(
-                    "warning: serving on {addr} exposes snapshots to the network — \
-                     anyone who can reach it can read snapshotted content"
+                    "warning: plaintext serve on {addr} — anyone who can reach it \
+                     can read snapshotted content (use --psk for encrypted sync)"
                 );
+            } else if !is_loopback(&addr) && psk.is_some() {
+                eprintln!("serving secured on {addr} (Noise NNpsk0)");
             }
             println!(
-                "serving on {addr}{}",
+                "serving on {addr}{}{}",
+                if psk.is_some() { " (secured)" } else { "" },
                 if announce { " (announcing)" } else { "" }
             );
-            sync::serve(store, &addr, announce)?;
+            sync::serve(store, &addr, announce, psk)?;
         }
         Cmd::Peers { secs } => {
             println!("listening {secs}s for beacons…");
             for p in sync::discover(secs)? {
-                println!("  {p}");
+                println!("  {}{}", p.addr, if p.secured { " (secured)" } else { "" });
             }
         }
-        Cmd::Pull { addr } => {
+        Cmd::Pull { addr, psk } => {
             let (store, _) = open_store()?;
-            let r = sync::pull(&store, &addr)?;
+            let _lock = store.try_lock()?;
+            let r = sync::pull(&store, &addr, psk.as_deref())?;
             match r.remote_head {
                 Some(h) => {
                     audit::record(
@@ -338,8 +415,72 @@ fn run() -> Result<()> {
                 None => println!("remote has no snapshots"),
             }
         }
+        Cmd::Guard { revert, full, cmd } => {
+            let (store, root) = open_store()?;
+            let policy = match revert {
+                RevertArg::Never => guard::RevertPolicy::Never,
+                RevertArg::OnFail => guard::RevertPolicy::OnFail,
+                RevertArg::Always => guard::RevertPolicy::Always,
+            };
+            let report = guard::run(&store, &root, &cmd, policy, full)?;
+            println!("guard snapshot {}", respawn::hash_hex(&report.snapshot));
+            match (report.exit_code, report.signal) {
+                (Some(c), _) => println!("command exited {c}"),
+                (None, Some(sig)) => println!("command killed by signal {sig}"),
+                (None, None) => println!("command status unknown"),
+            }
+            println!("drift vs guard snapshot:");
+            print_drift(&report.drift);
+            if report.reverted {
+                println!("worktree restored to guard snapshot");
+            } else if !report.drift.clean() {
+                println!(
+                    "undo with: respawn revert {} --force",
+                    respawn::hash_hex(&report.snapshot)
+                );
+            }
+            return Ok(report.process_exit_code());
+        }
+        Cmd::Anchor { sub } => {
+            let (store, _) = open_store()?;
+            match sub {
+                AnchorCmd::Keygen => {
+                    let _lock = store.try_lock()?;
+                    let pk = anchor::keygen(&store)?;
+                    audit::record(&store, "anchor-keygen", &pk)?;
+                    println!("anchor pubkey: {pk}");
+                    println!("record it off-fabric — `anchor verify --pubkey` pins against it");
+                }
+                AnchorCmd::Pubkey => {
+                    println!("{}", anchor::pubkey(&store)?);
+                }
+                AnchorCmd::Create { file } => {
+                    let _lock = store.try_lock()?;
+                    let covered = anchor::create(&store, &file)?;
+                    audit::record(&store, "anchor", &file.to_string_lossy())?;
+                    println!(
+                        "anchor written to {} (audit entries: {covered})",
+                        file.display()
+                    );
+                    println!("keep it outside .respawn/ — an anchor inside the thing it anchors proves nothing");
+                }
+                AnchorCmd::Verify { file, pubkey } => {
+                    let out = anchor::verify(&store, &file, pubkey.as_deref())?;
+                    println!("anchor valid — signed by {}", out.signer_pubkey);
+                    println!("anchored audit prefix: {} entries intact", out.audit_len);
+                    match (out.anchored_head, out.current_head) {
+                        (a, c) if a == c => println!("HEAD unchanged since anchor"),
+                        (a, c) => println!(
+                            "HEAD moved (normal — new snapshots): {} -> {}",
+                            a.unwrap_or_else(|| "none".into()),
+                            c.unwrap_or_else(|| "none".into())
+                        ),
+                    }
+                }
+            }
+        }
     }
-    Ok(())
+    Ok(0)
 }
 
 fn is_loopback(addr: &str) -> bool {
@@ -377,8 +518,11 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 }
 
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("error: {e}");
-        std::process::exit(1);
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
     }
 }

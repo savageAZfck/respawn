@@ -6,15 +6,21 @@
 //! store; the snapshot id is the BLAKE3 of those bytes — so the id itself
 //! is tamper-evident and replication-safe.
 
-use crate::{Error, Hash, Result, Store, CHUNK_SIZE, FABRIC_DIR};
+use crate::{cdc, Error, Hash, Result, Store, FABRIC_DIR};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Read;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
-pub const MANIFEST_VERSION: u32 = 2;
+/// Current manifest version. v3 = content-defined chunks (CDC); the
+/// format itself is unchanged — chunk boundaries live in the object set.
+/// v2 manifests (fixed 64 KiB chunks) remain readable; v3 refuses older
+/// wire peers only because old builds refuse unknown versions, not
+/// because anything in v2 was unsafe.
+pub const MANIFEST_VERSION: u32 = 3;
+/// Oldest manifest version this build will load.
+pub const MIN_MANIFEST_VERSION: u32 = 2;
 
 /// Hard caps applied when accepting a manifest — chiefly from `pull`,
 /// where a hostile peer controls the bytes.
@@ -44,6 +50,11 @@ pub struct Manifest {
     pub timestamp_secs: u64,
     pub message: String,
     pub files: Vec<FileEntry>,
+    /// Files whose content was still changing when captured (metadata
+    /// disagreed across the read window after all retries). Recorded so
+    /// a reviewer knows which entries may not reflect a quiet tree.
+    #[serde(default)]
+    pub unstable: Vec<String>,
 }
 
 impl Manifest {
@@ -66,7 +77,7 @@ impl Manifest {
     /// load and again before `revert` writes anything — a manifest that
     /// arrived over the wire is attacker-controlled bytes.
     pub fn validate(&self) -> Result<()> {
-        if self.version != MANIFEST_VERSION {
+        if self.version > MANIFEST_VERSION || self.version < MIN_MANIFEST_VERSION {
             return Err(Error::Corrupt(format!(
                 "unsupported manifest version {}",
                 self.version
@@ -163,31 +174,107 @@ fn ignore_patterns(root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// O_NOFOLLOW: a path swapped for a symlink between the directory walk
+/// and the open must fail, not leak worktree-external content into the
+/// store. No libc dep — the flag value is stable per OS ABI.
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW: i32 = 0x0100;
+#[cfg(target_os = "linux")]
+const O_NOFOLLOW: i32 = 0x20000;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn open_nofollow(path: &Path) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(Error::Io)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn open_nofollow(path: &Path) -> Result<fs::File> {
+    fs::File::open(path).map_err(Error::Io)
+}
+
 /// Chunk a file into the store, returning (content_hash, chunk_hashes, size).
+/// Content-defined boundaries: inserts shift a cut point or two instead
+/// of rewriting every downstream chunk.
 fn chunk_file(store: &Store, path: &Path) -> Result<(Hash, Vec<Hash>, u64)> {
-    let mut f = fs::File::open(path)?;
+    let f = open_nofollow(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut chunks = Vec::new();
-    let mut buf = vec![0u8; CHUNK_SIZE];
     let mut size = 0u64;
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        chunks.push(store.put_object(&buf[..n])?);
-        size += n as u64;
+    for chunk in cdc::Chunker::new(f) {
+        let data = chunk?;
+        hasher.update(&data);
+        chunks.push(store.put_object(&data)?);
+        size += data.len() as u64;
     }
     Ok((*hasher.finalize().as_bytes(), chunks, size))
 }
 
+/// Snapshot-id for `path`'s metadata — (mtime, size) — used to detect a
+/// file that mutated while it was being read. A file is only captured
+/// once its before/after metadata agrees; bounded retries keep a tree
+/// under active write from looping forever.
+const QUIESCE_RETRIES: u32 = 3;
+
+fn file_stamp(meta: &fs::Metadata) -> (u64, u64) {
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() * 1_000_000_000 + d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    (meta.len(), mtime)
+}
+
+/// Chunk `path` with a quiescence check: stamp metadata, read, stamp
+/// again — a file that changed mid-capture is re-read. Not a true
+/// point-in-time cut (that is what `--apfs` is for), but it shrinks the
+/// mutation window to a single file read; a file still churning after
+/// QUIESCE_RETRIES is flagged, not silently snapshotted.
+fn chunk_file_stable(
+    store: &Store,
+    path: &Path,
+    unstable: &mut Vec<String>,
+    rel_str: &str,
+) -> Result<(Hash, Vec<Hash>, u64)> {
+    for attempt in 0..=QUIESCE_RETRIES {
+        // symlink_metadata + O_NOFOLLOW inside chunk_file: a regular
+        // file swapped for a link mid-capture is refused, not followed.
+        let before = fs::symlink_metadata(path).map(|m| file_stamp(&m))?;
+        let captured = chunk_file(store, path)?;
+        let after = fs::symlink_metadata(path).map(|m| file_stamp(&m))?;
+        if before == after || attempt == QUIESCE_RETRIES {
+            if before != after {
+                unstable.push(rel_str.to_string());
+            }
+            return Ok(captured);
+        }
+    }
+    unreachable!()
+}
+
 /// Walk the worktree and snapshot it. Returns the new snapshot id.
 pub fn create(store: &Store, root: &Path, message: &str) -> Result<Hash> {
-    let patterns = ignore_patterns(root);
-    let mut files = Vec::new();
+    create_from(store, root, message)
+}
 
-    for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
+/// Snapshot by reading `scan_root` — `--apfs` passes a frozen APFS
+/// mount mirroring the worktree; the manifest paths are still relative
+/// to the tree root, so the result is indistinguishable from a live
+/// read (except it is atomic at the filesystem layer).
+pub fn create_from(store: &Store, scan_root: &Path, message: &str) -> Result<Hash> {
+    let patterns = ignore_patterns(scan_root);
+    let mut files = Vec::new();
+    let mut unstable = Vec::new();
+
+    for entry in WalkDir::new(scan_root)
+        .follow_links(false)
+        .sort_by_file_name()
+    {
         // Skip unreadable entries (e.g. root-owned dirs) rather than
         // aborting the whole snapshot — a daily agent must be resilient.
         let entry = match entry {
@@ -200,7 +287,7 @@ pub fn create(store: &Store, root: &Path, message: &str) -> Result<Hash> {
         if !entry.file_type().is_file() {
             continue;
         }
-        let rel = entry.path().strip_prefix(root).unwrap().to_path_buf();
+        let rel = entry.path().strip_prefix(scan_root).unwrap().to_path_buf();
         if excluded(&rel) {
             continue;
         }
@@ -210,7 +297,8 @@ pub fn create(store: &Store, root: &Path, message: &str) -> Result<Hash> {
         }
         crate::sanitize_rel(&rel_str)?;
         let meta = entry.metadata()?;
-        let (content, chunks, size) = chunk_file(store, entry.path())?;
+        let (content, chunks, size) =
+            chunk_file_stable(store, entry.path(), &mut unstable, &rel_str)?;
         let (mtime_secs, mtime_nanos) = meta
             .modified()
             .ok()
@@ -238,7 +326,15 @@ pub fn create(store: &Store, root: &Path, message: &str) -> Result<Hash> {
             .as_secs(),
         message: message.to_string(),
         files,
+        unstable,
     };
+    if !manifest.unstable.is_empty() {
+        eprintln!(
+            "respawn: {} file(s) captured while still changing: {}",
+            manifest.unstable.len(),
+            manifest.unstable.join(", ")
+        );
+    }
     let bytes = manifest.serialize()?;
     let id = store.put_manifest(&bytes)?;
     store.set_head(Some(&id))?;

@@ -162,7 +162,7 @@ fn sync_pull_replicates_objects() {
     let addr = format!("127.0.0.1:{port}");
     let serve_addr = addr.clone();
     std::thread::spawn(move || {
-        let _ = sync::serve(src_store, &serve_addr, false);
+        let _ = sync::serve(src_store, &serve_addr, false, None);
     });
     std::thread::sleep(std::time::Duration::from_millis(300));
 
@@ -170,7 +170,7 @@ fn sync_pull_replicates_objects() {
     let dst = TempDir::new().unwrap();
     Store::init(dst.path()).unwrap();
     let dst_store = Store::open(dst.path()).unwrap();
-    let report = sync::pull(&dst_store, &addr).unwrap();
+    let report = sync::pull(&dst_store, &addr, None).unwrap();
 
     assert_eq!(report.remote_head, Some(head));
     assert!(report.manifests_fetched >= 1);
@@ -208,6 +208,7 @@ fn manifest_with(path: &str, mode: u32) -> Manifest {
             content: respawn::hash_bytes(b"hello"),
             chunks: vec![],
         }],
+        unstable: Vec::new(),
     }
 }
 
@@ -343,14 +344,14 @@ fn pull_short_frames_error_not_panic() {
 
     // Truncated HEAD response.
     let addr = fake_server(vec![vec![1u8, 0xAA]]); // 2 bytes, need 33
-    assert!(sync::pull(&store, &addr).is_err());
+    assert!(sync::pull(&store, &addr, None).is_err());
 
     // Valid HEAD, then a 3-byte manifest response.
     let head = respawn::hash_bytes(b"x");
     let mut head_resp = vec![1u8];
     head_resp.extend_from_slice(&head);
     let addr = fake_server(vec![head_resp, vec![0, 1, 2]]);
-    assert!(sync::pull(&store, &addr).is_err());
+    assert!(sync::pull(&store, &addr, None).is_err());
 }
 
 #[test]
@@ -365,7 +366,7 @@ fn pull_rejects_traversal_manifest_over_wire() {
     let mut head_resp = vec![1u8];
     head_resp.extend_from_slice(&id);
     let addr = fake_server(vec![head_resp, len_frame(&bytes)]);
-    assert!(sync::pull(&store, &addr).is_err());
+    assert!(sync::pull(&store, &addr, None).is_err());
 }
 
 #[test]

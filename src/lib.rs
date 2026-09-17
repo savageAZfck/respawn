@@ -6,15 +6,20 @@
 //! replication between peers over the LAN. Every mutation is recorded in a
 //! hash-chained audit log.
 
+pub mod anchor;
+pub mod apfs;
 pub mod audit;
+pub mod cdc;
 pub mod drift;
+pub mod guard;
 pub mod revert;
+pub mod secure;
 pub mod snapshot;
 pub mod store;
 pub mod sync;
 pub mod watch;
 
-pub use store::Store;
+pub use store::{FabricLock, Store};
 
 use std::io;
 
@@ -24,9 +29,17 @@ pub type Hash = [u8; 32];
 /// Directory inside the worktree that holds all fabric state.
 pub const FABRIC_DIR: &str = ".respawn";
 
-/// Fixed chunk size for file content. Content-defined chunking is a
-/// possible future optimization; fixed chunks keep dedup predictable.
-pub const CHUNK_SIZE: usize = 64 * 1024;
+/// Content-defined chunking bounds (FastCDC, normalized). Chunks land
+/// near CDC_AVG; inserts shift a boundary or two instead of every chunk.
+/// Legacy v1/v2 manifests used fixed 64 KiB chunks — still readable:
+/// chunk size is implicit in the object set, not the manifest format.
+pub const CDC_MIN: usize = 16 * 1024;
+pub const CDC_AVG: usize = 64 * 1024;
+pub const CDC_MAX: usize = 256 * 1024;
+
+/// Largest object the store will decompress on read. Objects are file
+/// chunks, so anything past CDC_MAX is not a chunk the fabric produced.
+pub const MAX_OBJECT_SIZE: usize = CDC_MAX;
 
 #[derive(Debug)]
 pub enum Error {
@@ -37,6 +50,7 @@ pub enum Error {
     BadHash(String),
     Sync(String),
     UnsafePath(String),
+    Locked(String),
 }
 
 impl std::fmt::Display for Error {
@@ -51,6 +65,7 @@ impl std::fmt::Display for Error {
             Error::BadHash(m) => write!(f, "bad hash: {m}"),
             Error::Sync(m) => write!(f, "sync error: {m}"),
             Error::UnsafePath(p) => write!(f, "unsafe path in manifest: {p:?}"),
+            Error::Locked(m) => write!(f, "fabric locked: {m}"),
         }
     }
 }

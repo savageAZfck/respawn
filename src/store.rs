@@ -6,12 +6,22 @@
 //! corrupted or tampered object is detected on access, not on audit.
 
 use crate::{hash_bytes, Error, Hash, Result, FABRIC_DIR};
+use fs2::FileExt;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub struct Store {
     root: PathBuf, // worktree root
+}
+
+/// Exclusive advisory lock on the fabric. Held via `flock` on
+/// `.respawn/lock` — the OS releases it on process exit or crash, so a
+/// dead holder can never wedge the fabric the way a stale PID file can.
+/// The fd is close-on-exec (std default), so spawned children do not
+/// inherit the lock.
+pub struct FabricLock {
+    _file: fs::File,
 }
 
 impl Store {
@@ -54,6 +64,33 @@ impl Store {
 
     pub fn fabric_dir(&self) -> PathBuf {
         self.root.join(FABRIC_DIR)
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Take the exclusive fabric lock, or fail fast if another process
+    /// holds it. Mutating operations (snap, revert, pull, guard, anchor)
+    /// must hold this for their whole critical section: a second writer
+    /// mid-operation could interleave object writes, fork the audit
+    /// chain, or swap HEAD under an in-flight revert.
+    pub fn try_lock(&self) -> Result<FabricLock> {
+        let path = self.fabric_dir().join("lock");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        file.try_lock_exclusive().map_err(|_| {
+            Error::Locked(
+                "another respawn process is using this worktree \
+                 (concurrent snap/pull/revert is unsupported by design)"
+                    .into(),
+            )
+        })?;
+        Ok(FabricLock { _file: file })
     }
 
     fn object_path(&self, h: &Hash) -> PathBuf {
@@ -102,8 +139,8 @@ impl Store {
 
     /// Read and decompress an object; verifies content hash on read.
     /// Objects are always file chunks, so decompressed size is bounded —
-    /// a blob that inflates past CHUNK_SIZE is rejected before the hash
-    /// check even runs.
+    /// a blob that inflates past MAX_OBJECT_SIZE is rejected before the
+    /// hash check even runs.
     pub fn get_object(&self, h: &Hash) -> Result<Vec<u8>> {
         let path = self.object_path(h);
         let compressed = fs::read(&path).map_err(|e| {
@@ -115,9 +152,9 @@ impl Store {
         })?;
         let decoder = zstd::Decoder::new(&compressed[..]).map_err(Error::Io)?;
         let mut data = Vec::new();
-        let mut bounded = decoder.take(crate::CHUNK_SIZE as u64 + 1);
+        let mut bounded = decoder.take(crate::MAX_OBJECT_SIZE as u64 + 1);
         bounded.read_to_end(&mut data).map_err(Error::Io)?;
-        if data.len() > crate::CHUNK_SIZE {
+        if data.len() > crate::MAX_OBJECT_SIZE {
             return Err(Error::Corrupt(format!(
                 "object {} exceeds chunk bound",
                 crate::short(h)

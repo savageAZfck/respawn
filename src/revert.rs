@@ -239,6 +239,7 @@ pub fn check_then_apply(
                 timestamp_secs: 0,
                 message: String::new(),
                 files: Vec::new(),
+                unstable: Vec::new(),
             },
             false,
         )?

@@ -114,3 +114,81 @@ pub fn verify(store: &Store) -> Result<VerifyReport> {
     }
     Ok(report)
 }
+
+/// Current (entries, tip hash) of the audit log — the state an anchor
+/// records. Strict: a non-empty unparseable line is an error, not a
+/// skip — an anchor must never checkpoint a corrupt log.
+pub fn tip(store: &Store) -> Result<(u64, String)> {
+    let path = audit_path(store);
+    if !path.exists() {
+        return Ok((0, String::new()));
+    }
+    let f = fs::File::open(&path)?;
+    let mut entries = 0u64;
+    let mut tip = String::new();
+    for (i, line) in BufReader::new(f).lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let e: AuditEntry = serde_json::from_str(&line)
+            .map_err(|_| crate::Error::Corrupt(format!("audit line {} unparsable", i + 1)))?;
+        entries = e.seq + 1;
+        tip = e.hash;
+    }
+    Ok((entries, tip))
+}
+
+/// Confirm that the first `len` entries of the live log still hash to
+/// `expected_tip` — i.e. the state an anchor recorded is a genuine
+/// prefix of what is on disk now. Entries *added after* the anchor are
+/// legal (work continued); a log shorter than `len`, a broken chain
+/// inside the covered region, or a mismatched tip means the covered
+/// history was altered.
+pub fn tip_is_prefix(store: &Store, len: u64, expected_tip: &str) -> Result<()> {
+    if len == 0 {
+        // The anchor covers no entries — nothing to check; HEAD and
+        // fabric_id carry the verifiable content.
+        return Ok(());
+    }
+    let path = audit_path(store);
+    if !path.exists() {
+        return Err(crate::Error::Corrupt(
+            "audit log missing since anchor".into(),
+        ));
+    }
+    let f = fs::File::open(&path)?;
+    let mut prev = String::new();
+    let mut seq = 0u64;
+    for line in BufReader::new(f).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if seq >= len {
+            break; // covered region verified — tail is post-anchor work
+        }
+        let e: AuditEntry = serde_json::from_str(&line)
+            .map_err(|_| crate::Error::Corrupt(format!("audit line {} unparsable", seq + 1)))?;
+        let expected = entry_hash(e.seq, e.ts, &e.event, &e.detail, &prev);
+        if e.seq != seq || e.prev != prev || e.hash != expected {
+            return Err(crate::Error::Corrupt(format!(
+                "audit chain broken inside anchored region at seq {}",
+                e.seq
+            )));
+        }
+        prev = e.hash;
+        seq += 1;
+    }
+    if seq < len {
+        return Err(crate::Error::Corrupt(format!(
+            "audit log truncated: anchor covers {len} entries, only {seq} present"
+        )));
+    }
+    if prev != expected_tip {
+        return Err(crate::Error::Corrupt(
+            "audit tip diverged from anchor — covered history was altered".into(),
+        ));
+    }
+    Ok(())
+}

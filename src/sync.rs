@@ -8,13 +8,18 @@
 //!     0x03 HAVE          + u32 n + n hashes → n bytes (0/1)
 //!     0x04 GET_OBJECT    + hash → u64 len + bytes (0 = missing)
 //!
+//! Transport: plaintext (legacy) or Noise NNpsk0 when a --psk is given
+//! (see secure.rs). A secured listener rejects non-selector connections,
+//! so a network peer cannot silently downgrade a hardened server.
+//!
 //! Receivers verify every object's BLAKE3 before storing — a hostile or
 //! corrupted peer cannot poison the store. `serve --announce` also
 //! broadcasts a UDP beacon so `peers` can discover listeners without
-//! knowing addresses.
+//! knowing addresses; secured listeners set a flag bit in the beacon.
 
+use crate::secure::{self, FrameIo, PlainStream, SecureStream};
 use crate::{Error, Hash, Result, Store};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -30,12 +35,14 @@ const OP_GET_MANIFEST: u8 = 0x02;
 const OP_HAVE: u8 = 0x03;
 const OP_GET_OBJECT: u8 = 0x04;
 
-const MAX_FRAME: usize = 64 * 1024 * 1024;
 const MAX_MANIFESTS_PER_PULL: usize = 100_000;
 const MAX_OBJECTS_PER_PULL: usize = 8_000_000;
-/// Hashes per HAVE request — keeps request frames well under MAX_FRAME.
+/// Hashes per HAVE request — keeps request frames well under the cap.
 const HAVE_BATCH: usize = 500_000;
 const MAX_CONNECTIONS: usize = 64;
+/// Seconds a connection may take to select a protocol / handshake
+/// before it is dropped — an idle holder is a slowloris, not a peer.
+const HELLO_TIMEOUT_SECS: u64 = 10;
 
 fn read_u64(frame: &[u8]) -> Result<u64> {
     if frame.len() < 8 {
@@ -49,31 +56,15 @@ fn frame_payload(frame: &[u8]) -> Result<&[u8]> {
     if len == 0 {
         return Ok(&[]);
     }
-    if frame.len() < 8 + len {
+    // Checked arithmetic: `8 + len` can wrap on a hostile u64 length —
+    // compare against the remainder instead of summing.
+    if len > frame.len().saturating_sub(8) {
         return Err(Error::Sync("truncated frame payload".into()));
     }
     Ok(&frame[8..8 + len])
 }
 
-fn read_frame(s: &mut TcpStream) -> Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    s.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_FRAME {
-        return Err(Error::Sync("frame too large".into()));
-    }
-    let mut buf = vec![0u8; len];
-    s.read_exact(&mut buf)?;
-    Ok(buf)
-}
-
-fn write_frame(s: &mut TcpStream, payload: &[u8]) -> Result<()> {
-    s.write_all(&(payload.len() as u32).to_le_bytes())?;
-    s.write_all(payload)?;
-    Ok(())
-}
-
-fn respond(s: &mut TcpStream, store: &Store, frame: &[u8]) -> Result<()> {
+fn respond(io: &mut FrameIo, store: &Store, frame: &[u8]) -> Result<()> {
     match frame.first().copied() {
         Some(OP_GET_HEAD) => {
             let head = store.head()?;
@@ -81,7 +72,7 @@ fn respond(s: &mut TcpStream, store: &Store, frame: &[u8]) -> Result<()> {
             if let Some(h) = head {
                 out.extend_from_slice(&h);
             }
-            write_frame(s, &out)?;
+            io.write_frame(&out)?;
         }
         Some(OP_GET_MANIFEST) if frame.len() == 33 => {
             let h: Hash = frame[1..].try_into().unwrap();
@@ -92,7 +83,7 @@ fn respond(s: &mut TcpStream, store: &Store, frame: &[u8]) -> Result<()> {
             };
             let mut out = (data.len() as u64).to_le_bytes().to_vec();
             out.extend_from_slice(&data);
-            write_frame(s, &out)?;
+            io.write_frame(&out)?;
         }
         Some(OP_HAVE) if frame.len() >= 5 => {
             let n = u32::from_le_bytes(frame[1..5].try_into().unwrap()) as usize;
@@ -104,38 +95,101 @@ fn respond(s: &mut TcpStream, store: &Store, frame: &[u8]) -> Result<()> {
                 let h: Hash = frame[5 + i * 32..5 + (i + 1) * 32].try_into().unwrap();
                 out.push(if store.has_object(&h) { 1u8 } else { 0u8 });
             }
-            write_frame(s, &out)?;
+            io.write_frame(&out)?;
         }
         Some(OP_GET_OBJECT) if frame.len() == 33 => {
             let h: Hash = frame[1..].try_into().unwrap();
             let data = store.get_object(&h).unwrap_or_default();
             let mut out = (data.len() as u64).to_le_bytes().to_vec();
             out.extend_from_slice(&data);
-            write_frame(s, &out)?;
+            io.write_frame(&out)?;
         }
         _ => return Err(Error::Sync("unknown opcode".into())),
     }
     Ok(())
 }
 
-/// Serve object requests on `addr` until killed. `--announce` spawns a
-/// UDP beacon thread. Connections are capped — each costs a thread, so
-/// an unbounded accept loop would be a one-line DoS.
-pub fn serve(store: Store, addr: &str, announce: bool) -> Result<()> {
+/// Per-connection entry: sniff the protocol selector, then run the
+/// request loop on whichever transport the client chose (and the server
+/// allows). Plaintext is only reachable when the server is unsecured —
+/// a --psk listener closes non-selector connections outright.
+fn serve_conn(mut s: TcpStream, store: &Store, psk: Option<&[u8; 32]>) -> Result<()> {
+    s.set_read_timeout(Some(Duration::from_secs(HELLO_TIMEOUT_SECS)))?;
+    // A client that never reads while we stream a large object would
+    // otherwise pin a thread (and its send buffer) forever.
+    s.set_write_timeout(Some(Duration::from_secs(30)))?;
+
+    let mut magic = [0u8; 4];
+    s.read_exact(&mut magic)?;
+
+    let mut io = if &magic == secure::PROTO_MAGIC {
+        let mut vm = [0u8; 2];
+        s.read_exact(&mut vm)?;
+        if vm[0] != secure::PROTO_VERSION || vm[1] != secure::MODE_NOISE {
+            return Err(Error::Sync("unsupported protocol selector".into()));
+        }
+        let key =
+            psk.ok_or_else(|| Error::Sync("secured connection to an unsecured listener".into()))?;
+        FrameIo::Secure(SecureStream::accept(s, key)?)
+    } else {
+        if psk.is_some() {
+            return Err(Error::Sync(
+                "plaintext connection to a --psk listener".into(),
+            ));
+        }
+        // Legacy client: the 4 bytes already read were the first
+        // frame's length prefix — reconstruct the frame before the loop.
+        let len = u32::from_le_bytes(magic) as usize;
+        if len == 0 || len > 64 * 1024 * 1024 {
+            return Err(Error::Sync("first frame length invalid".into()));
+        }
+        let mut first = vec![0u8; len];
+        s.read_exact(&mut first)?;
+        let mut io = FrameIo::Plain(PlainStream { stream: s });
+        respond(&mut io, store, &first)?;
+        io
+    };
+
+    loop {
+        match io.read_frame() {
+            Ok(frame) if !frame.is_empty() => {
+                if respond(&mut io, store, &frame).is_err() {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    Ok(())
+}
+
+/// Serve object requests on `addr` until killed. `psk` arms Noise-only
+/// mode; `--announce` spawns a UDP beacon thread (flag byte set when
+/// secured). Connections are capped — each costs a thread, so an
+/// unbounded accept loop would be a one-line DoS.
+pub fn serve(store: Store, addr: &str, announce: bool, psk: Option<String>) -> Result<()> {
+    let psk_bytes = psk.map(|p| secure::derive_psk(&p));
     let listener = TcpListener::bind(addr)?;
     let store = Arc::new(store);
+    let psk_bytes = Arc::new(psk_bytes);
     let conns = Arc::new(AtomicUsize::new(0));
 
     if announce {
         let port = listener.local_addr()?.port();
-        std::thread::spawn(move || loop {
+        let secured = psk_bytes.is_some();
+        std::thread::spawn(move || {
+            // One socket for the beacon's lifetime — binding per send
+            // churns ephemeral ports every 3 s forever.
             if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
                 let _ = sock.set_broadcast(true);
                 let mut msg = MAGIC.to_vec();
                 msg.extend_from_slice(&port.to_le_bytes());
-                let _ = sock.send_to(&msg, format!("255.255.255.255:{BEACON_PORT}"));
+                msg.push(if secured { 1u8 } else { 0u8 });
+                loop {
+                    let _ = sock.send_to(&msg, format!("255.255.255.255:{BEACON_PORT}"));
+                    std::thread::sleep(Duration::from_secs(3));
+                }
             }
-            std::thread::sleep(Duration::from_secs(3));
         });
     }
 
@@ -149,23 +203,27 @@ pub fn serve(store: Store, addr: &str, announce: bool) -> Result<()> {
         }
         conns.fetch_add(1, Ordering::Relaxed);
         let st = Arc::clone(&store);
+        let key = Arc::clone(&psk_bytes);
         let count = Arc::clone(&conns);
         std::thread::spawn(move || {
-            let mut s = conn;
-            while let Ok(frame) = read_frame(&mut s) {
-                if frame.is_empty() || respond(&mut s, &st, &frame).is_err() {
-                    break;
-                }
-            }
+            let _ = serve_conn(conn, &st, key.as_ref().as_ref());
             count.fetch_sub(1, Ordering::Relaxed);
         });
     }
     Ok(())
 }
 
-/// Listen ~`secs` for beacon announcements; returns (addr, head-port)
-/// pairs found. Excludes our own beacon only by chance — callers filter.
-pub fn discover(secs: u64) -> Result<Vec<String>> {
+/// A peer discovered via beacon: address plus whether it demands a
+/// secured transport (flag bit, present on protocol ≥2 beacons).
+#[derive(Debug, Clone)]
+pub struct DiscoveredPeer {
+    pub addr: String,
+    pub secured: bool,
+}
+
+/// Listen ~`secs` for beacon announcements; returns peers found.
+/// Excludes our own beacon only by chance — callers filter.
+pub fn discover(secs: u64) -> Result<Vec<DiscoveredPeer>> {
     let sock = UdpSocket::bind(("0.0.0.0", BEACON_PORT))?;
     sock.set_read_timeout(Some(Duration::from_millis(300)))?;
     let deadline = std::time::Instant::now() + Duration::from_secs(secs);
@@ -173,14 +231,30 @@ pub fn discover(secs: u64) -> Result<Vec<String>> {
     let mut buf = [0u8; 16];
     while std::time::Instant::now() < deadline {
         match sock.recv_from(&mut buf) {
-            Ok((n, from)) if n == 7 && &buf[..5] == MAGIC => {
+            Ok((n, from)) if (n == 7 || n == 8) && &buf[..5] == MAGIC => {
                 let port = u16::from_le_bytes([buf[5], buf[6]]);
-                found.insert(format!("{}:{}", from.ip(), port));
+                let secured = n == 8 && buf[7] & 1 == 1;
+                found.insert(DiscoveredPeer {
+                    addr: format!("{}:{}", from.ip(), port),
+                    secured,
+                });
             }
             _ => continue,
         }
     }
     Ok(found.into_iter().collect())
+}
+
+impl PartialEq for DiscoveredPeer {
+    fn eq(&self, other: &Self) -> bool {
+        self.addr == other.addr
+    }
+}
+impl Eq for DiscoveredPeer {}
+impl std::hash::Hash for DiscoveredPeer {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.addr.hash(state);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -198,15 +272,21 @@ pub struct PullReport {
 /// bounds-checked, every object and manifest is hash-verified and
 /// validated before it is accepted, the parent walk is cycle-guarded
 /// and capped, and nothing from the wire ever reaches the worktree.
-pub fn pull(store: &Store, addr: &str) -> Result<PullReport> {
+/// `psk` upgrades the transport to authenticated encryption — the
+/// contents still verify either way; the key hides them on the wire.
+pub fn pull(store: &Store, addr: &str, psk: Option<&str>) -> Result<PullReport> {
     let mut report = PullReport::default();
-    let mut s =
-        TcpStream::connect(addr).map_err(|e| Error::Sync(format!("connect {addr}: {e}")))?;
+    let s = TcpStream::connect(addr).map_err(|e| Error::Sync(format!("connect {addr}: {e}")))?;
     s.set_read_timeout(Some(Duration::from_secs(30)))?;
     s.set_write_timeout(Some(Duration::from_secs(30)))?;
 
-    write_frame(&mut s, &[OP_GET_HEAD])?;
-    let resp = read_frame(&mut s)?;
+    let mut io = match psk {
+        Some(p) => FrameIo::Secure(SecureStream::connect(s, &secure::derive_psk(p))?),
+        None => FrameIo::Plain(PlainStream { stream: s }),
+    };
+
+    io.write_frame(&[OP_GET_HEAD])?;
+    let resp = io.read_frame()?;
     if resp.len() != 33 || resp[0] != 1 {
         if resp.first().copied() == Some(0) {
             return Ok(report); // remote has no head
@@ -233,8 +313,8 @@ pub fn pull(store: &Store, addr: &str) -> Result<PullReport> {
         }
         let mut req = vec![OP_GET_MANIFEST];
         req.extend_from_slice(&cur);
-        write_frame(&mut s, &req)?;
-        let resp = read_frame(&mut s)?;
+        io.write_frame(&req)?;
+        let resp = io.read_frame()?;
         let data = frame_payload(&resp)?;
         if data.is_empty() {
             return Err(Error::Sync(format!(
@@ -271,8 +351,8 @@ pub fn pull(store: &Store, addr: &str) -> Result<PullReport> {
         for h in batch {
             req.extend_from_slice(h);
         }
-        write_frame(&mut s, &req)?;
-        let have = read_frame(&mut s)?;
+        io.write_frame(&req)?;
+        let have = io.read_frame()?;
         if have.len() != batch.len() {
             return Err(Error::Sync("HAVE response truncated".into()));
         }
@@ -280,8 +360,8 @@ pub fn pull(store: &Store, addr: &str) -> Result<PullReport> {
             if have[i] == 1 && !store.has_object(h) {
                 let mut req = vec![OP_GET_OBJECT];
                 req.extend_from_slice(h);
-                write_frame(&mut s, &req)?;
-                let resp = read_frame(&mut s)?;
+                io.write_frame(&req)?;
+                let resp = io.read_frame()?;
                 let data = frame_payload(&resp)?;
                 if data.is_empty() {
                     return Err(Error::Sync(format!(
