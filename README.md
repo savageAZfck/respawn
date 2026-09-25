@@ -159,7 +159,7 @@ worktree/
 
 ```sh
 brew tap savageAZfck/tap
-brew install respawn    # 0.1.0-beta, universal macOS binary
+brew install respawn    # 0.2.0-beta, universal macOS binary
 ```
 
 ## Consolidation note
