@@ -7,7 +7,7 @@ fuzz_target!(|data: &[u8]| {
     if data.len() > 4 * 1024 * 1024 {
         return;
     }
-    if let Ok(chunks) = respawn::cdc::chunk_bytes(data) {
+    if let Ok(chunks) = respawned::cdc::chunk_bytes(data) {
         let total: usize = chunks.iter().map(|c| c.len()).sum();
         assert_eq!(total, data.len(), "chunk lengths must cover input");
     }

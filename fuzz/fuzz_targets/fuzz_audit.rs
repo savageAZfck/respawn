@@ -1,6 +1,6 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use respawn::{audit, Store};
+use respawned::{audit, Store};
 use std::sync::OnceLock;
 
 // The audit log is attacker-writable in the threat model (a hostile

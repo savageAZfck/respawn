@@ -1,8 +1,8 @@
 //! Wave 1–3 feature and adversarial tests: fabric lock, guard, anchors,
 //! secured sync, and content-defined chunking.
 
-use respawn::snapshot::Manifest;
-use respawn::{admin, anchor, audit, cdc, guard, schedule, snapshot, sync, Error, Store};
+use respawned::snapshot::Manifest;
+use respawned::{admin, anchor, audit, cdc, guard, schedule, snapshot, sync, Error, Store};
 use std::fs;
 use std::net::TcpListener;
 use std::path::Path;
@@ -420,7 +420,7 @@ fn pull_survives_hostile_frame_lengths() {
     // A manifest response whose u64 length field is u64::MAX: the old
     // `8 + len` check wrapped and the slice panicked — the client must
     // error, never crash.
-    let head = respawn::hash_bytes(b"x");
+    let head = respawned::hash_bytes(b"x");
     let mut head_resp = vec![1u8];
     head_resp.extend_from_slice(&head);
     let mut evil = u64::MAX.to_le_bytes().to_vec();
@@ -466,7 +466,7 @@ fn snapshot_never_reads_through_symlinks() {
     // The link is skipped — not followed, not captured.
     assert!(!m.files.iter().any(|f| f.path == "link.txt"));
     // And no object in the store holds the outside content.
-    let secret_hash = respawn::hash_bytes(b"DO-NOT-SNAPSHOT");
+    let secret_hash = respawned::hash_bytes(b"DO-NOT-SNAPSHOT");
     assert!(!store.has_object(&secret_hash));
 }
 
@@ -489,7 +489,7 @@ fn cdc_respects_bounds_and_dedups_inserts() {
     let total: usize = chunks.iter().map(|c| c.len()).sum();
     assert_eq!(total, data.len());
     for c in &chunks {
-        assert!(c.len() <= respawn::CDC_MAX);
+        assert!(c.len() <= respawned::CDC_MAX);
         // Normalized CDC may emit a final short tail chunk; the bound
         // that matters is the max — every chunk but the last is >= MIN.
     }
@@ -499,10 +499,10 @@ fn cdc_respects_bounds_and_dedups_inserts() {
     let mut edited = data.clone();
     edited.insert(100, 0xAB);
     let chunks2 = cdc::chunk_bytes(&edited).unwrap();
-    let h1: std::collections::HashSet<_> = chunks.iter().map(|c| respawn::hash_bytes(c)).collect();
+    let h1: std::collections::HashSet<_> = chunks.iter().map(|c| respawned::hash_bytes(c)).collect();
     let kept = chunks2
         .iter()
-        .filter(|c| h1.contains(&respawn::hash_bytes(c)))
+        .filter(|c| h1.contains(&respawned::hash_bytes(c)))
         .count();
     assert!(
         kept >= chunks.len() - 2,
@@ -551,7 +551,7 @@ fn apfs_snapshot_if_privileged() {
     let store = Store::open(t.path()).unwrap();
     let live_id = snapshot::create(&store, t.path(), "live").unwrap();
 
-    match respawn::apfs::create(t.path()) {
+    match respawned::apfs::create(t.path()) {
         Ok(frozen) => {
             let frozen_id = snapshot::create_from(&store, frozen.scan_root(), "frozen").unwrap();
             let live = snapshot::load(&store, &live_id).unwrap();

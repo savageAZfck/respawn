@@ -1,4 +1,4 @@
-use respawn::{audit, drift, revert, snapshot, sync, Store};
+use respawned::{audit, drift, revert, snapshot, sync, Store};
 use std::fs;
 use std::net::TcpListener;
 use std::path::Path;
@@ -116,7 +116,7 @@ fn tampered_object_detected() {
     let chunk = m.files.iter().find(|f| f.path == "a.txt").unwrap().chunks[0];
 
     // Corrupt the stored object on disk.
-    let hex = respawn::hash_hex(&chunk);
+    let hex = respawned::hash_hex(&chunk);
     let obj = root
         .join(".respawn/objects")
         .join(&hex[..2])
@@ -190,12 +190,12 @@ fn sync_pull_replicates_objects() {
 
 // ---------- adversarial tests ----------
 
-use respawn::snapshot::{FileEntry, Manifest};
+use respawned::snapshot::{FileEntry, Manifest};
 use std::io::{Read, Write};
 
 fn manifest_with(path: &str, mode: u32) -> Manifest {
     Manifest {
-        version: respawn::snapshot::MANIFEST_VERSION,
+        version: respawned::snapshot::MANIFEST_VERSION,
         parent: None,
         timestamp_secs: 0,
         message: String::new(),
@@ -205,7 +205,7 @@ fn manifest_with(path: &str, mode: u32) -> Manifest {
             size: 5,
             mtime_secs: 0,
             mtime_nanos: 0,
-            content: respawn::hash_bytes(b"hello"),
+            content: respawned::hash_bytes(b"hello"),
             chunks: vec![],
         }],
         unstable: Vec::new(),
@@ -328,7 +328,7 @@ fn revert_blocks_symlink_ancestor() {
     let chunk = store.put_object(b"payload").unwrap();
     let mut m = manifest_with("dir/pwned.txt", 0o644);
     m.files[0].chunks = vec![chunk];
-    m.files[0].content = respawn::hash_bytes(b"payload");
+    m.files[0].content = respawned::hash_bytes(b"payload");
     fs::remove_dir_all(root.join("dir")).unwrap();
     std::os::unix::fs::symlink(outside.path(), root.join("dir")).unwrap();
 
@@ -347,7 +347,7 @@ fn pull_short_frames_error_not_panic() {
     assert!(sync::pull(&store, &addr, None).is_err());
 
     // Valid HEAD, then a 3-byte manifest response.
-    let head = respawn::hash_bytes(b"x");
+    let head = respawned::hash_bytes(b"x");
     let mut head_resp = vec![1u8];
     head_resp.extend_from_slice(&head);
     let addr = fake_server(vec![head_resp, vec![0, 1, 2]]);
@@ -362,7 +362,7 @@ fn pull_rejects_traversal_manifest_over_wire() {
 
     let evil = manifest_with("../owned.txt", 0o644);
     let bytes = evil.serialize().unwrap();
-    let id = respawn::hash_bytes(&bytes);
+    let id = respawned::hash_bytes(&bytes);
     let mut head_resp = vec![1u8];
     head_resp.extend_from_slice(&id);
     let addr = fake_server(vec![head_resp, len_frame(&bytes)]);
@@ -399,7 +399,7 @@ fn junk_files_dont_break_store_scans() {
     let id = snapshot::create(&store, root, "").unwrap();
 
     // Drop foreign files into the fan-out dirs.
-    let hex = respawn::hash_hex(&id);
+    let hex = respawned::hash_hex(&id);
     fs::write(
         root.join(".respawn/manifests").join(&hex[..2]).join("junk"),
         b"x",
@@ -409,7 +409,7 @@ fn junk_files_dont_break_store_scans() {
     fs::create_dir_all(root.join(".respawn/objects/notahex")).unwrap();
 
     assert_eq!(
-        snapshot::resolve(&store, &respawn::hash_hex(&id)).unwrap(),
+        snapshot::resolve(&store, &respawned::hash_hex(&id)).unwrap(),
         id
     );
     assert!(snapshot::list(&store)

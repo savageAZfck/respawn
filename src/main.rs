@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use respawn::snapshot;
-use respawn::{
+use respawned::snapshot;
+use respawned::{
     admin, anchor, apfs, audit, drift, guard, revert, schedule, sync, watch, Error, Result, Store,
 };
 use std::path::PathBuf;
@@ -246,8 +246,8 @@ fn run() -> Result<i32> {
             } else {
                 snapshot::create(&store, &root, &message)?
             };
-            audit::record(&store, "snap", &respawn::hash_hex(&id))?;
-            println!("snapshot {}", respawn::hash_hex(&id));
+            audit::record(&store, "snap", &respawned::hash_hex(&id))?;
+            println!("snapshot {}", respawned::hash_hex(&id));
         }
         Cmd::Log { n } => {
             let (store, _) = open_store()?;
@@ -261,7 +261,7 @@ fn run() -> Result<i32> {
                 };
                 println!(
                     "{}  {}{}  ({} files){}",
-                    respawn::short(&id),
+                    respawned::short(&id),
                     chrono_ts(m.timestamp_secs),
                     msg,
                     m.files.len(),
@@ -273,9 +273,9 @@ fn run() -> Result<i32> {
             let (store, _) = open_store()?;
             let id = snapshot::resolve(&store, &id)?;
             let m = snapshot::load(&store, &id)?;
-            println!("snapshot {}", respawn::hash_hex(&id));
+            println!("snapshot {}", respawned::hash_hex(&id));
             if let Some(p) = m.parent {
-                println!("parent   {}", respawn::hash_hex(&p));
+                println!("parent   {}", respawned::hash_hex(&p));
             }
             println!("time     {}", chrono_ts(m.timestamp_secs));
             if !m.message.is_empty() {
@@ -291,7 +291,7 @@ fn run() -> Result<i32> {
             let id = snapshot::resolve(&store, &id)?;
             let m = snapshot::load(&store, &id)?;
             let r = drift::detect(&root, &m, full)?;
-            println!("drift vs {}:", respawn::short(&id));
+            println!("drift vs {}:", respawned::short(&id));
             print_drift(&r);
         }
         Cmd::Diff { old, new } => {
@@ -340,14 +340,14 @@ fn run() -> Result<i32> {
                         "revert",
                         &format!(
                             "{} restored {} removed {}",
-                            respawn::short(&id),
+                            respawned::short(&id),
                             r.restored.len(),
                             r.removed.len()
                         ),
                     )?;
                     println!(
                         "reverted to {}: {} restored, {} removed, {} extra kept",
-                        respawn::short(&id),
+                        respawned::short(&id),
                         r.restored.len(),
                         r.removed.len(),
                         r.skipped_extra.len()
@@ -387,10 +387,10 @@ fn run() -> Result<i32> {
                     for e in std::fs::read_dir(fan.path())? {
                         let e = e?;
                         let full = format!("{}{}", fan_hex, e.file_name().to_string_lossy());
-                        if !respawn::is_hash_name(&full) {
+                        if !respawned::is_hash_name(&full) {
                             continue; // foreign file, not an object
                         }
-                        let h = respawn::parse_hash(&full)?;
+                        let h = respawned::parse_hash(&full)?;
                         match store.get_object(&h) {
                             Ok(_) => checked += 1,
                             Err(_) => bad += 1,
@@ -444,7 +444,7 @@ fn run() -> Result<i32> {
                         "pull",
                         &format!(
                             "{addr} head {} objects {}",
-                            respawn::short(&h),
+                            respawned::short(&h),
                             r.objects_fetched
                         ),
                     )?;
@@ -452,7 +452,7 @@ fn run() -> Result<i32> {
                         "pulled {} manifests, {} objects ({} skipped) from {addr}",
                         r.manifests_fetched, r.objects_fetched, r.objects_skipped
                     );
-                    println!("remote head: {}", respawn::hash_hex(&h));
+                    println!("remote head: {}", respawned::hash_hex(&h));
                 }
                 None => println!("remote has no snapshots"),
             }
@@ -465,7 +465,7 @@ fn run() -> Result<i32> {
                 RevertArg::Always => guard::RevertPolicy::Always,
             };
             let report = guard::run(&store, &root, &cmd, policy, full)?;
-            println!("guard snapshot {}", respawn::hash_hex(&report.snapshot));
+            println!("guard snapshot {}", respawned::hash_hex(&report.snapshot));
             match (report.exit_code, report.signal) {
                 (Some(c), _) => println!("command exited {c}"),
                 (None, Some(sig)) => println!("command killed by signal {sig}"),
@@ -478,7 +478,7 @@ fn run() -> Result<i32> {
             } else if !report.drift.clean() {
                 println!(
                     "undo with: respawn revert {} --force",
-                    respawn::hash_hex(&report.snapshot)
+                    respawned::hash_hex(&report.snapshot)
                 );
             }
             return Ok(report.process_exit_code());

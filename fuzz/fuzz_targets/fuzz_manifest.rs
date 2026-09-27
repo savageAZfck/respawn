@@ -1,6 +1,6 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use respawn::snapshot::Manifest;
+use respawned::snapshot::Manifest;
 
 // Manifests cross the wire — a peer's manifest is attacker bytes.
 // deserialize caps size; validate must reject anything unusable.

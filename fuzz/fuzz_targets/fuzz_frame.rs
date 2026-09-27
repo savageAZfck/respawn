@@ -1,6 +1,6 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use respawn::Store;
+use respawned::Store;
 use std::sync::OnceLock;
 
 // The sync request parser against a real (empty) store: opcode
@@ -15,5 +15,5 @@ fn store() -> &'static Store {
 }
 
 fuzz_target!(|data: &[u8]| {
-    let _ = respawn::sync::respond_frame(store(), data);
+    let _ = respawned::sync::respond_frame(store(), data);
 });

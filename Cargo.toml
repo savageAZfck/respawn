@@ -1,5 +1,5 @@
 [package]
-name = "respawn"
+name = "respawned"
 version = "0.3.0"
 edition = "2021"
 description = "Versioned respawn: content-addressed snapshots, atomic revert, drift detection, LAN sync"

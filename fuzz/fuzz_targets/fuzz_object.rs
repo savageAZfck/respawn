@@ -1,6 +1,6 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use respawn::Store;
+use respawned::Store;
 use std::sync::OnceLock;
 
 // Corrupt/truncated zstd blobs on disk: decompression is bounded, and
