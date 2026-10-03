@@ -271,6 +271,12 @@ fn anchor_refuses_to_live_inside_fabric() {
     // An anchor inside .respawn/ can be replaced with the log it proves.
     assert!(anchor::create(&store, &root.join(".respawn/anchor.json")).is_err());
     assert!(anchor::create(&store, &root.join(".respawn/objects/x.json")).is_err());
+    // A parent that doesn't exist yet must not skip the check —
+    // atomic_write would create it inside the fabric.
+    assert!(anchor::create(&store, &root.join(".respawn/newdir/anchor.json")).is_err());
+    assert!(anchor::create(&store, &root.join(".respawn/a/b/c/anchor.json")).is_err());
+    // Same dodge through a `..` component.
+    assert!(anchor::create(&store, &root.join("nope/../.respawn/anchor.json")).is_err());
 }
 
 #[test]

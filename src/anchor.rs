@@ -90,6 +90,24 @@ pub fn fabric_id(store: &Store) -> Result<String> {
     }
 }
 
+/// Lexically resolve `.`/`..` without touching the filesystem — for
+/// paths whose components don't all exist yet (canonicalize's blind
+/// spot). Does not chase symlinks; that's what canonicalizing the
+/// existing ancestor is for.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(dir)?;
@@ -148,19 +166,39 @@ pub struct CreateOutcome {
 pub fn create(store: &Store, out: &Path) -> Result<CreateOutcome> {
     // An anchor inside the fabric it anchors can be replaced alongside
     // the log it claims to prove — refuse the footgun outright. The file
-    // may not exist yet, so canonicalize the parent, not the path.
-    let parent = out.parent().unwrap_or_else(|| Path::new("."));
-    if let Ok(canon_parent) = parent.canonicalize() {
-        let candidate = canon_parent.join(out.file_name().unwrap_or_default());
-        let fabric = store
-            .fabric_dir()
-            .canonicalize()
-            .unwrap_or_else(|_| store.fabric_dir());
-        if candidate.starts_with(&fabric) {
-            return Err(Error::Corrupt(
-                "anchor must live outside .respawn/ — inside the fabric it proves nothing".into(),
-            ));
+    // and its parent may not exist yet: canonicalize the deepest existing
+    // ancestor, reattach the missing tail, and lexically normalize so a
+    // not-yet-created directory can't skip the check.
+    let parent = normalize(out.parent().unwrap_or_else(|| Path::new(".")));
+    let mut ancestor = parent.clone();
+    let mut tail: Vec<PathBuf> = Vec::new();
+    while ancestor.canonicalize().is_err() {
+        match ancestor.file_name() {
+            Some(name) => {
+                tail.push(PathBuf::from(name));
+                ancestor.pop();
+            }
+            None => break,
         }
+    }
+    let resolved_parent = match ancestor.canonicalize() {
+        Ok(mut base) => {
+            for seg in tail.iter().rev() {
+                base.push(seg);
+            }
+            base
+        }
+        Err(_) => parent.clone(),
+    };
+    let candidate = normalize(&resolved_parent.join(out.file_name().unwrap_or_default()));
+    let fabric = store
+        .fabric_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| store.fabric_dir());
+    if candidate.starts_with(&fabric) {
+        return Err(Error::Corrupt(
+            "anchor must live outside .respawn/ — inside the fabric it proves nothing".into(),
+        ));
     }
     let (sk, note) = load_key(store)?;
     let (audit_len, audit_tip) = audit::tip(store)?;
