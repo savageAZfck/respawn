@@ -209,6 +209,7 @@ fn manifest_with(path: &str, mode: u32) -> Manifest {
             chunks: vec![],
         }],
         unstable: Vec::new(),
+        actor: None,
     }
 }
 

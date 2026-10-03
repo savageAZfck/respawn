@@ -55,6 +55,11 @@ pub struct Manifest {
     /// a reviewer knows which entries may not reflect a quiet tree.
     #[serde(default)]
     pub unstable: Vec<String>,
+    /// Which actor produced this snapshot (`--actor` / RESPAWN_ACTOR).
+    /// Lives inside the serialized bytes — the snapshot id covers it,
+    /// so attribution is as tamper-evident as the file list.
+    #[serde(default)]
+    pub actor: Option<String>,
 }
 
 impl Manifest {
@@ -267,9 +272,28 @@ pub fn create(store: &Store, root: &Path, message: &str) -> Result<Hash> {
 /// to the tree root, so the result is indistinguishable from a live
 /// read (except it is atomic at the filesystem layer).
 pub fn create_from(store: &Store, scan_root: &Path, message: &str) -> Result<Hash> {
+    create_from_actor(store, scan_root, message, env_actor().as_deref())
+}
+
+fn env_actor() -> Option<String> {
+    std::env::var("RESPAWN_ACTOR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// `create_from` with explicit actor attribution — the tag lands inside
+/// the serialized manifest, so the snapshot id covers it.
+pub fn create_from_actor(
+    store: &Store,
+    scan_root: &Path,
+    message: &str,
+    actor: Option<&str>,
+) -> Result<Hash> {
     let patterns = ignore_patterns(scan_root);
+    let tombstones = crate::purge::tombstones(store)?;
     let mut files = Vec::new();
     let mut unstable = Vec::new();
+    let mut purged = Vec::new();
 
     for entry in WalkDir::new(scan_root)
         .follow_links(false)
@@ -295,10 +319,23 @@ pub fn create_from(store: &Store, scan_root: &Path, message: &str) -> Result<Has
         if patterns.iter().any(|p| rel_str.contains(p.as_str())) {
             continue;
         }
+        if tombstones.iter().any(|t| t.path == rel_str) {
+            purged.push(rel_str.clone());
+            continue;
+        }
         crate::sanitize_rel(&rel_str)?;
         let meta = entry.metadata()?;
         let (content, chunks, size) =
             chunk_file_stable(store, entry.path(), &mut unstable, &rel_str)?;
+        // Content-level tombstone: the same bytes under a new name are
+        // still purged — a rename is not a resurrection.
+        if tombstones
+            .iter()
+            .any(|t| t.content == crate::hash_hex(&content))
+        {
+            purged.push(rel_str.clone());
+            continue;
+        }
         let (mtime_secs, mtime_nanos) = meta
             .modified()
             .ok()
@@ -327,7 +364,15 @@ pub fn create_from(store: &Store, scan_root: &Path, message: &str) -> Result<Has
         message: message.to_string(),
         files,
         unstable,
+        actor: actor.map(String::from),
     };
+    if !purged.is_empty() {
+        eprintln!(
+            "respawn: skipped {} purged path(s): {}",
+            purged.len(),
+            purged.join(", ")
+        );
+    }
     if !manifest.unstable.is_empty() {
         eprintln!(
             "respawn: {} file(s) captured while still changing: {}",

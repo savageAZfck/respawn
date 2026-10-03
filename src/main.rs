@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use respawned::snapshot;
 use respawned::{
-    admin, anchor, apfs, audit, drift, guard, revert, schedule, sync, watch, Error, Result, Store,
+    admin, anchor, apfs, audit, drift, fleet, guard, purge, revert, schedule, sync, watch, Error,
+    Result, Store,
 };
 use std::path::PathBuf;
 
@@ -28,6 +29,9 @@ enum Cmd {
         /// Snapshot message
         #[arg(short, long, default_value = "")]
         message: String,
+        /// Tag this snapshot with an actor name (RESPAWN_ACTOR works too)
+        #[arg(long)]
+        actor: Option<String>,
         /// Capture a true point-in-time cut via an APFS snapshot
         /// (macOS, requires root for mount_apfs)
         #[arg(long)]
@@ -63,10 +67,13 @@ enum Cmd {
         #[arg(default_value = "head")]
         new: String,
     },
-    /// Revert the worktree to a snapshot
+    /// Revert the worktree to a snapshot — or surgically undo one actor
     Revert {
-        /// Snapshot ref
-        id: String,
+        /// Snapshot ref (not needed with --actor)
+        id: Option<String>,
+        /// Undo only this actor's changes, keep everyone else's
+        #[arg(long)]
+        actor: Option<String>,
         /// Keep files the snapshot doesn't know about
         #[arg(long)]
         keep_extra: bool,
@@ -125,6 +132,51 @@ enum Cmd {
     Anchor {
         #[command(subcommand)]
         sub: AnchorCmd,
+    },
+    /// Erase a path from the fabric's reach — tombstone it, sweep its
+    /// objects, and issue a signed certificate of erasure
+    Purge {
+        /// Worktree-relative path to erase (omit with --verify)
+        path: Option<String>,
+        /// Verify a purge certificate instead of purging
+        #[arg(long)]
+        verify: Option<PathBuf>,
+        /// Pin the expected signer public key (hex) when verifying
+        #[arg(long)]
+        pubkey: Option<String>,
+    },
+    /// Signed revert orders for peers under one fleet key
+    Fleet {
+        #[command(subcommand)]
+        sub: FleetCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum FleetCmd {
+    /// Pin the fleet order-signing pubkey (first pin wins — remove
+    /// .respawn/fleet.pub to re-pin)
+    Trust { pubkey: String },
+    /// Mint a signed order telling the fleet to land on SNAPSHOT
+    Order {
+        /// Snapshot ref every applying peer should land on
+        to: String,
+        /// Where the signed order file goes
+        out: PathBuf,
+    },
+    /// Verify and apply a signed fleet order locally
+    Apply {
+        /// The signed order file
+        file: PathBuf,
+        /// Pull the target snapshot from this peer if missing
+        #[arg(long)]
+        from: Option<String>,
+        /// Passphrase the peer's `serve` was started with
+        #[arg(long)]
+        psk: Option<String>,
+        /// Apply even with un-snapshotted changes
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -226,6 +278,7 @@ fn run() -> Result<i32> {
         }
         Cmd::Snap {
             message,
+            actor,
             apfs,
             ask_admin,
         } => {
@@ -238,13 +291,14 @@ fn run() -> Result<i32> {
                 return admin::snap_as_admin(&exe, &root, &store.fabric_dir(), &message).map(|_| 0);
             }
             let _lock = store.try_lock()?;
+            let actor = actor.or_else(|| std::env::var("RESPAWN_ACTOR").ok());
             let id = if apfs {
                 // Frozen view: the ApfsSnap Drop unmounts and deletes
                 // the cut however create_from returns — success or not.
                 let frozen = apfs::create(&root)?;
-                snapshot::create_from(&store, frozen.scan_root(), &message)?
+                snapshot::create_from_actor(&store, frozen.scan_root(), &message, actor.as_deref())?
             } else {
-                snapshot::create(&store, &root, &message)?
+                snapshot::create_from_actor(&store, &root, &message, actor.as_deref())?
             };
             audit::record(&store, "snap", &respawned::hash_hex(&id))?;
             println!("snapshot {}", respawned::hash_hex(&id));
@@ -317,11 +371,72 @@ fn run() -> Result<i32> {
         }
         Cmd::Revert {
             id,
+            actor,
             keep_extra,
             force,
         } => {
             let (store, root) = open_store()?;
             let _lock = store.try_lock()?;
+            if let Some(actor_name) = actor {
+                // Surgical undo: virtual manifest where the actor's
+                // snapshots never ran. keep_extra stays on — the bulk
+                // removal pass can't tell actor files from user files,
+                // so actor-only paths are removed explicitly below.
+                let (vm, touched) = revert::surgical_manifest(&store, &actor_name)?;
+                let vm_paths: std::collections::HashSet<&str> =
+                    vm.files.iter().map(|f| f.path.as_str()).collect();
+                let (drift_r, applied) = revert::check_then_apply(&store, &root, &vm, true, force)?;
+                let r = match applied {
+                    None => {
+                        eprintln!("worktree has un-snapshotted changes:");
+                        print_drift(&drift_r);
+                        eprintln!("use --force to revert anyway");
+                        return Err(Error::Corrupt("revert refused".into()));
+                    }
+                    Some(r) => r,
+                };
+                // Paths the actor created (touched but absent from the
+                // virtual manifest) still sit on disk — remove them.
+                // resolve_dest keeps the same ancestor-symlink defense
+                // the main revert path uses.
+                let mut removed_actor = 0u64;
+                for p in &touched {
+                    if !vm_paths.contains(p.as_str()) {
+                        let dest = revert::resolve_dest(&root, p)?;
+                        match std::fs::symlink_metadata(&dest) {
+                            Ok(m) if m.is_file() || m.file_type().is_symlink() => {
+                                std::fs::remove_file(&dest)?;
+                                removed_actor += 1;
+                            }
+                            Ok(_) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(Error::Io(e)),
+                        }
+                    }
+                }
+                // Snapshot the result so HEAD tracks the undone tree.
+                let nid = snapshot::create_from_actor(
+                    &store,
+                    &root,
+                    &format!("surgical undo of actor '{actor_name}'"),
+                    None,
+                )?;
+                audit::record(
+                    &store,
+                    "revert-actor",
+                    &format!("{actor_name} {} paths", touched.len()),
+                )?;
+                println!(
+                    "undid {} path(s) by '{actor_name}': {} restored, {} removed (snapshot {})",
+                    touched.len(),
+                    r.restored.len(),
+                    removed_actor,
+                    respawned::short(&nid)
+                );
+                return Ok(0);
+            }
+            let id =
+                id.ok_or_else(|| Error::Corrupt("revert needs a snapshot ref or --actor".into()))?;
             let id = snapshot::resolve(&store, &id)?;
             let m = snapshot::load(&store, &id)?;
             let (drift_r, applied) =
@@ -482,6 +597,62 @@ fn run() -> Result<i32> {
                 );
             }
             return Ok(report.process_exit_code());
+        }
+        Cmd::Purge {
+            path,
+            verify,
+            pubkey,
+        } => {
+            let (store, root) = open_store()?;
+            if let Some(cert) = verify {
+                let out = purge::verify_cert(&store, &cert, pubkey.as_deref())?;
+                println!("{out}");
+                return Ok(0);
+            }
+            let path = path.ok_or_else(|| {
+                Error::Corrupt("purge needs a worktree-relative path (or --verify)".into())
+            })?;
+            let _lock = store.try_lock()?;
+            let r = purge::run(&store, &root, &path)?;
+            println!(
+                "purged {path}: {} chunks removed, {} shared-retained, cert {}",
+                r.chunks_removed,
+                r.chunks_retained_shared,
+                r.cert_path.display()
+            );
+            if r.live_removed {
+                println!("live file removed");
+            }
+            if let Some(n) = r.note {
+                println!("note: {n}");
+            }
+        }
+        Cmd::Fleet { sub } => {
+            let (store, root) = open_store()?;
+            match sub {
+                FleetCmd::Trust { pubkey } => {
+                    let _lock = store.try_lock()?;
+                    fleet::trust(&store, &pubkey)?;
+                    println!("fleet key pinned: {pubkey}");
+                }
+                FleetCmd::Order { to, out } => {
+                    let _lock = store.try_lock()?;
+                    let path = fleet::order(&store, &to, &out)?;
+                    audit::record(&store, "fleet-order", &out.to_string_lossy())?;
+                    println!("fleet order written to {}", path.display());
+                }
+                FleetCmd::Apply {
+                    file,
+                    from,
+                    psk,
+                    force,
+                } => {
+                    let _lock = store.try_lock()?;
+                    let target =
+                        fleet::apply(&store, &root, &file, from.as_deref(), psk.as_deref(), force)?;
+                    println!("fleet revert applied: {}", respawned::hash_hex(&target));
+                }
+            }
         }
         Cmd::Anchor { sub } => {
             let (store, root) = open_store()?;

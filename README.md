@@ -22,6 +22,8 @@ respawn status          # drift vs HEAD (added/modified/deleted)
 respawn status --full   # rehash every file — don't trust metadata
 respawn diff v1 head    # compare two snapshots
 respawn revert <id>     # materialize a snapshot (atomic per file)
+respawn revert --actor alice   # undo only alice's snapshots, keep everyone else's
+respawn snap --actor alice     # attribute a snapshot for surgical undo
 respawn log             # snapshot history
 respawn verify          # audit chain + object integrity
 
@@ -37,6 +39,13 @@ respawn serve --psk <secret>            # encrypted, authenticated LAN serve
 respawn serve --announce                # plaintext serve + UDP beacon
 respawn peers                           # discover announcing peers
 respawn pull host:4789 --psk <secret>   # replicate a peer's history
+
+respawn purge secret.txt          # tombstone + sweep + signed erasure cert
+respawn purge --verify cert.json  # prove a purge happened — no content kept
+
+respawn fleet trust <pubkey>            # pin the order-signing key (once)
+respawn fleet order <snap> order.json   # mint a signed revert order
+respawn fleet apply order.json          # peer: verify sig + fabric, revert
 ```
 
 ## What it actually guarantees
@@ -77,6 +86,29 @@ respawn pull host:4789 --psk <secret>   # replicate a peer's history
   on load and re-validated at the write boundary; absolute paths and
   `..` components are rejected, symlinked ancestors block the write, and
   modes are masked to `0o777` so setuid bits never propagate.
+- **Certified erasure.** `purge <path>` tombstones a path (by name and
+  by content hash — a rename doesn't resurrect it), deletes the objects
+  only it referenced, removes the live file, and issues an ed25519-signed
+  certificate: fabric id, path, content hash, chunk counts, audit tip.
+  `snap` skips tombstoned content, `revert` refuses any manifest that
+  still carries it, and `--verify` proves the erasure without retaining
+  a byte of what was erased. Chunks still referenced by other content
+  are retained — and the certificate says so; a cert claiming total
+  destruction while dedup'd data lived on would be a lie.
+- **Agent-surgical undo.** `snap --actor <name>` (or `RESPAWN_ACTOR`)
+  tags a snapshot; the tag is inside the serialized manifest, so the
+  snapshot id covers the attribution. `revert --actor <name>` replays
+  the HEAD chain, finds every path where that actor's snapshots changed
+  the tree, and restores each to the newest non-actor state — but a
+  later snapshot that merely *captured* the actor's bytes doesn't count
+  as someone else's work, so blessed-onward content still dies.
+- **Fleet revert.** `fleet order` mints a signed instruction (fabric
+  id, target snapshot, timestamp, nonce) that travels by any channel.
+  `fleet apply` on a peer verifies the signer against the pinned
+  `.respawn/fleet.pub` (first pin wins — a rogue order can't rotate the
+  trust root), refuses orders bound to a different fabric, refuses
+  replayed orders older than the newest one applied, optionally pulls
+  the target with `--from`, and lands the whole fleet on the same state.
 
 ## What it does not guarantee (honest limits)
 
@@ -137,6 +169,21 @@ respawn pull host:4789 --psk <secret>   # replicate a peer's history
 - **No `watch` auto-snapshotting.** `watch` reports drift events;
   `guard` is the policy-driven pre-write snapshot. A watch-triggered
   auto-snapshot mode is not implemented.
+- **Purge bounds: content, not provenance.** A purge certificate proves
+  the named path and its content hash are tombstoned and that the
+  chunks only that content referenced are gone — it cannot prove a
+  motivated attacker didn't copy the bytes elsewhere first, and chunks
+  shared with live content stay (the cert counts them). Peers that
+  later `pull` can re-deliver the purged objects into the store:
+  tombstones still block snap/revert resurrection, but erasure-at-rest
+  across the fleet means purging every replica.
+- **Actor attribution is per-snapshot.** `--actor` tags the whole
+  manifest — every diff captured in that snapshot is attributed to the
+  actor, including edits other actors left uncommitted in the worktree
+  at snap time. Surgical undo is per-path: if two actors edited the
+  same file, undoing one restores the other's newest version when it
+  exists, else the pre-touch state — the alternative (a line-level
+  merge) is a different tool's job.
 
 ## Layout
 
@@ -152,6 +199,10 @@ worktree/
     anchor.secret             ed25519 anchor key (0600) — fallback when the
                               macOS Keychain is unavailable/disabled
     last_anchor               hash of the newest anchor file — the chain link
+    purged.jsonl              tombstones: path+content pairs never to keep
+    purges/                   signed erasure certificates
+    fleet.pub                 pinned fleet order-signing pubkey
+    fleet_seen                ts of newest applied fleet order (anti-replay)
     remotes/<peer>            last-pulled remote heads
 ```
 

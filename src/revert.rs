@@ -48,7 +48,11 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
 /// (e.g. from an extracted archive or a malicious script) must not let
 /// a revert write outside the worktree. Path syntax itself was already
 /// validated by `Manifest::validate`; this guards the on-disk reality.
-fn resolve_dest(root: &Path, rel: &str) -> Result<PathBuf> {
+/// Resolve a manifest-relative path to a safe on-disk destination:
+/// rejects escapes, unsafe components, and any ancestor that is a
+/// symlink (the write boundary's path defense, usable by callers that
+/// remove or inspect paths under the same rules).
+pub fn resolve_dest(root: &Path, rel: &str) -> Result<PathBuf> {
     let rel = crate::sanitize_rel(rel)?;
     let dest = root.join(&rel);
 
@@ -95,6 +99,21 @@ pub fn apply(
     // validated by load(), but apply is the write boundary — a manifest
     // that escapes validation anywhere must still not write here.
     manifest.validate()?;
+
+    // Purged content never comes back — tombstones outlive the
+    // manifests that carried the data.
+    let tombstones = crate::purge::tombstones(store)?;
+    for fe in &manifest.files {
+        if tombstones
+            .iter()
+            .any(|t| t.path == fe.path || t.content == crate::hash_hex(&fe.content))
+        {
+            return Err(Error::Corrupt(format!(
+                "manifest contains purged content ({}) — erasure cannot be reverted",
+                fe.path
+            )));
+        }
+    }
 
     let mut report = RevertReport::default();
     let wanted: HashSet<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
@@ -240,6 +259,7 @@ pub fn check_then_apply(
                 message: String::new(),
                 files: Vec::new(),
                 unstable: Vec::new(),
+                actor: None,
             },
             false,
         )?
@@ -252,4 +272,129 @@ pub fn check_then_apply(
     }
     let r = apply(store, root, manifest, keep_extra)?;
     Ok((report, Some(r)))
+}
+
+/// Build the manifest HEAD would have if `actor`'s snapshots had never
+/// run — undo what one actor did, keep everyone else's work.
+///
+/// A path is "touched" wherever an actor-tagged snapshot disagrees with
+/// its parent. Touched paths resolve to the newest state recorded by a
+/// NON-actor snapshot (or drop if no non-actor snapshot carries them) —
+/// so later work by other actors on the same path survives the undo.
+/// Untouched paths keep their HEAD state.
+///
+/// Only the HEAD chain is considered; pulled branches are out of scope
+/// for v1 (documented — surgical undo reasons about local authorship).
+pub fn surgical_manifest(store: &Store, actor: &str) -> Result<(Manifest, Vec<String>)> {
+    use std::collections::{BTreeSet, HashMap};
+
+    let mut chain = Vec::new();
+    let mut cur = store.head()?;
+    let mut guard = 0usize;
+    while let Some(id) = cur {
+        if guard > 2_000_000 {
+            return Err(Error::Corrupt("manifest chain too long".into()));
+        }
+        guard += 1;
+        let m = crate::snapshot::load(store, &id)?;
+        cur = m.parent;
+        chain.push(m);
+    }
+    chain.reverse(); // oldest → newest
+    let head_m = match chain.last() {
+        Some(m) => m.clone(),
+        None => return Err(Error::Corrupt("no HEAD snapshot".into())),
+    };
+
+    // touched: paths where an actor snapshot disagrees with whatever
+    // snapshot preceded it. `pre` keeps the pre-touch entry (or absence)
+    // from the FIRST touch — the state to fall back to.
+    let mut touched: BTreeSet<String> = BTreeSet::new();
+    let mut pre: HashMap<String, Option<crate::snapshot::FileEntry>> = HashMap::new();
+    // Content hashes the actor actually wrote per path — a later
+    // non-actor snapshot that merely *captured* the actor's bytes is
+    // not "someone else's work" and must not resurrect them.
+    let mut actor_content: HashMap<String, std::collections::HashSet<crate::Hash>> = HashMap::new();
+    // `effective`: newest entry per path from non-actor snapshots whose
+    // content the actor didn't write.
+    let mut effective: HashMap<String, crate::snapshot::FileEntry> = HashMap::new();
+    let mut prev: HashMap<String, &crate::snapshot::FileEntry> = HashMap::new();
+    for m in &chain {
+        let cur_map: HashMap<String, &crate::snapshot::FileEntry> =
+            m.files.iter().map(|f| (f.path.clone(), f)).collect();
+        if m.actor.as_deref() == Some(actor) {
+            for (p, fe) in &cur_map {
+                if prev.get(p).map(|pe| pe.content) != Some(fe.content) {
+                    touched.insert(p.clone());
+                    pre.entry(p.clone())
+                        .or_insert_with(|| prev.get(p).map(|e| (*e).clone()));
+                }
+                actor_content
+                    .entry(p.clone())
+                    .or_default()
+                    .insert(fe.content);
+            }
+            for p in prev.keys() {
+                if !cur_map.contains_key(p) {
+                    touched.insert(p.clone());
+                    pre.entry(p.clone())
+                        .or_insert_with(|| prev.get(p).map(|e| (*e).clone()));
+                }
+            }
+        } else {
+            for fe in &m.files {
+                let actor_bytes = actor_content
+                    .get(&fe.path)
+                    .map(|s| s.contains(&fe.content))
+                    .unwrap_or(false);
+                if !actor_bytes {
+                    effective.insert(fe.path.clone(), fe.clone());
+                }
+            }
+        }
+        prev = cur_map;
+    }
+    if touched.is_empty() {
+        return Err(Error::Corrupt(format!(
+            "no changes by actor '{actor}' in the HEAD chain"
+        )));
+    }
+
+    // Resolution per touched path: newest non-actor entry that isn't
+    // the actor's bytes, else the pre-touch entry, else the path drops
+    // (the actor created it).
+    let resolve = |p: &String| -> Option<crate::snapshot::FileEntry> {
+        effective
+            .get(p)
+            .cloned()
+            .or_else(|| pre.get(p).cloned().flatten())
+    };
+
+    let mut files = Vec::new();
+    for f in &head_m.files {
+        if touched.contains(&f.path) {
+            if let Some(e) = resolve(&f.path) {
+                files.push(e);
+            } // else: actor created it — drops out
+        } else {
+            files.push(f.clone());
+        }
+    }
+    // Paths the actor deleted (absent from HEAD but in touched): bring
+    // back whatever resolve finds, if anything.
+    let head_paths: std::collections::HashSet<&str> =
+        head_m.files.iter().map(|f| f.path.as_str()).collect();
+    for p in &touched {
+        if !head_paths.contains(p.as_str()) {
+            if let Some(e) = resolve(p) {
+                files.push(e);
+            }
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let mut vm = head_m;
+    vm.files = files;
+    vm.message = format!("surgical undo of actor '{actor}'");
+    Ok((vm, touched.into_iter().collect()))
 }

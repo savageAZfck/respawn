@@ -2,7 +2,9 @@
 //! secured sync, and content-defined chunking.
 
 use respawned::snapshot::Manifest;
-use respawned::{admin, anchor, audit, cdc, guard, schedule, snapshot, sync, Error, Store};
+use respawned::{
+    admin, anchor, audit, cdc, fleet, guard, purge, revert, schedule, snapshot, sync, Error, Store,
+};
 use std::fs;
 use std::net::TcpListener;
 use std::path::Path;
@@ -505,7 +507,8 @@ fn cdc_respects_bounds_and_dedups_inserts() {
     let mut edited = data.clone();
     edited.insert(100, 0xAB);
     let chunks2 = cdc::chunk_bytes(&edited).unwrap();
-    let h1: std::collections::HashSet<_> = chunks.iter().map(|c| respawned::hash_bytes(c)).collect();
+    let h1: std::collections::HashSet<_> =
+        chunks.iter().map(|c| respawned::hash_bytes(c)).collect();
     let kept = chunks2
         .iter()
         .filter(|c| h1.contains(&respawned::hash_bytes(c)))
@@ -688,4 +691,201 @@ fn sh_quote_survives_real_shell() {
 fn admin_escapes_cover_metachars() {
     assert_eq!(admin::sh_quote("it's"), r"'it'\''s'");
     assert_eq!(admin::as_escape("a\\b\"c"), "a\\\\b\\\"c");
+}
+
+// ---------- Wave 4: purge / actor-surgical revert / fleet ----------
+
+#[test]
+fn purge_tombstones_sweeps_and_certifies() {
+    let t = fixture();
+    let root = t.path();
+    let store = Store::open(root).unwrap();
+    anchor::keygen(&store).unwrap();
+    write(root, "secret.txt", b"top secret bytes");
+    snapshot::create(&store, root, "with-secret").unwrap();
+
+    let r = purge::run(&store, root, "secret.txt").unwrap();
+    assert!(!root.join("secret.txt").exists()); // live file gone
+    assert!(r.cert_path.exists());
+    assert!(r.chunks_removed >= 1);
+    assert_eq!(r.chunks_retained_shared, 0);
+
+    // Certificate verifies against this fabric.
+    let out = purge::verify_cert(&store, &r.cert_path, None).unwrap();
+    assert!(out.contains("secret.txt"));
+
+    // Tampered cert fails.
+    let bytes = fs::read(&r.cert_path).unwrap();
+    let mut cert: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    cert["sig"] = serde_json::json!("00".repeat(64));
+    let bad = root.join("bad-cert.json");
+    fs::write(&bad, serde_json::to_vec(&cert).unwrap()).unwrap();
+    assert!(purge::verify_cert(&store, &bad, None).is_err());
+
+    // Double purge refuses.
+    assert!(purge::run(&store, root, "secret.txt").is_err());
+
+    // The purged path stays dead in future snapshots — by name AND by
+    // content under a new name.
+    write(root, "secret.txt", b"top secret bytes");
+    write(root, "renamed.txt", b"top secret bytes");
+    let m_id = snapshot::create(&store, root, "post-purge").unwrap();
+    let m = snapshot::load(&store, &m_id).unwrap();
+    assert!(!m.files.iter().any(|f| f.path == "secret.txt"));
+    assert!(!m.files.iter().any(|f| f.path == "renamed.txt"));
+    assert!(m.files.iter().any(|f| f.path == "a.txt"));
+
+    // Reverting the pre-purge snapshot refuses: it carries purged data.
+    let snaps = snapshot::list(&store).unwrap();
+    let pre = snaps
+        .iter()
+        .find(|(_, m)| m.files.iter().any(|f| f.path == "secret.txt"))
+        .unwrap();
+    assert!(revert::apply(&store, root, &pre.1, false).is_err());
+}
+
+#[test]
+fn purge_shared_chunks_survive_and_report() {
+    let t = fixture();
+    let root = t.path();
+    let store = Store::open(root).unwrap();
+    anchor::keygen(&store).unwrap();
+    let big = vec![7u8; 200_000];
+    write(root, "shared_a.bin", &big);
+    write(root, "shared_b.bin", &big);
+    snapshot::create(&store, root, "dupes").unwrap();
+
+    // Purge A — its chunks are shared with B, so nothing is deleted
+    // and the certificate says why.
+    let r = purge::run(&store, root, "shared_a.bin").unwrap();
+    assert_eq!(r.chunks_removed, 0);
+    assert!(r.chunks_retained_shared >= 1);
+
+    // Content-level tombstone also kills shared_b's bytes in future
+    // snaps (same content — erasure follows content, not filenames).
+    let m_id = snapshot::create(&store, root, "after").unwrap();
+    let m = snapshot::load(&store, &m_id).unwrap();
+    assert!(!m.files.iter().any(|f| f.path == "shared_b.bin"));
+}
+
+#[test]
+fn surgical_revert_undoes_only_named_actor() {
+    let t = fixture();
+    let root = t.path();
+    let store = Store::open(root).unwrap();
+    snapshot::create(&store, root, "base").unwrap(); // neutral
+
+    // Alice adds a file and edits a.txt.
+    write(root, "alice_new.txt", b"alice made this");
+    write(root, "a.txt", b"alice rewrote hello");
+    snapshot::create_from_actor(&store, root, "alice work", Some("alice")).unwrap();
+
+    // Bob adds his own file and edits a.txt again.
+    write(root, "bob_new.txt", b"bob made this");
+    write(root, "a.txt", b"bob rewrote it further");
+    snapshot::create_from_actor(&store, root, "bob work", Some("bob")).unwrap();
+
+    // Surgical undo of alice: her additions die, her edits revert,
+    // bob's work survives — including his later edit of the same file
+    // alice touched (bob's bytes aren't alice's).
+    let (vm, touched) = revert::surgical_manifest(&store, "alice").unwrap();
+    assert!(touched.contains(&"alice_new.txt".to_string()));
+    assert!(touched.contains(&"a.txt".to_string()));
+    assert!(!touched.contains(&"bob_new.txt".to_string()));
+
+    let map: std::collections::HashMap<_, _> =
+        vm.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    // alice_new dropped; a.txt restored to bob's version; bob_new kept.
+    assert!(!map.contains_key("alice_new.txt"));
+    assert!(map.contains_key("bob_new.txt"));
+    let a_chunks = &map["a.txt"].chunks;
+    let a_data: Vec<u8> = a_chunks
+        .iter()
+        .flat_map(|h| store.get_object(h).unwrap())
+        .collect();
+    assert_eq!(a_data, b"bob rewrote it further");
+
+    // Full cycle: apply it on disk (keep_extra=false removes files
+    // outside the virtual manifest — i.e., alice's additions).
+    revert::apply(&store, root, &vm, false).unwrap();
+    assert!(!root.join("alice_new.txt").exists());
+    assert!(root.join("bob_new.txt").exists());
+    assert_eq!(
+        fs::read(root.join("a.txt")).unwrap(),
+        b"bob rewrote it further"
+    );
+
+    // Unknown actor refuses.
+    assert!(revert::surgical_manifest(&store, "mallory").is_err());
+}
+
+#[test]
+fn fleet_order_verifies_signer_fabric_and_applies() {
+    let t = fixture();
+    let root = t.path().to_path_buf();
+    let store = Store::open(&root).unwrap();
+    anchor::keygen(&store).unwrap();
+    let pubkey = anchor::pubkey(&store).unwrap();
+
+    snapshot::create(&store, &root, "v1").unwrap();
+    write(&root, "a.txt", b"changed");
+    snapshot::create(&store, &root, "v2").unwrap();
+
+    // Mint an order sending the fleet to the v1 snapshot.
+    let v1 = snapshot::list(&store).unwrap()[1].0;
+    let order_path = root.join("order.json");
+    fleet::order(&store, &respawned::hash_hex(&v1), &order_path).unwrap();
+
+    // Clone the fabric to a second worktree — same fabric_id + key, as
+    // a fleet peer that synced state would have.
+    let t2 = TempDir::new().unwrap();
+    let root2 = t2.path().to_path_buf();
+    fs::create_dir_all(&root2).unwrap();
+    let src = root.join(".respawn");
+    for e in fs::read_dir(&src).unwrap() {
+        let e = e.unwrap();
+        let dst = root2.join(".respawn").join(e.file_name());
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        if e.file_type().unwrap().is_dir() {
+            let _ = std::process::Command::new("cp")
+                .args(["-R"])
+                .arg(e.path())
+                .arg(&dst)
+                .status();
+        } else {
+            fs::copy(e.path(), &dst).unwrap();
+        }
+    }
+    let store2 = Store::open(&root2).unwrap();
+    write(&root2, "a.txt", b"peer local work");
+
+    // No pinned key yet — refuses.
+    assert!(fleet::apply(&store2, &root2, &order_path, None, None, false).is_err());
+
+    // Pin a WRONG key — refuses.
+    fleet::trust(&store2, &"ab".repeat(32)).unwrap();
+    assert!(fleet::apply(&store2, &root2, &order_path, None, None, false).is_err());
+
+    // Re-pin to the real key — applies.
+    fs::remove_file(root2.join(".respawn/fleet.pub")).unwrap();
+    fleet::trust(&store2, &pubkey).unwrap();
+    let applied = fleet::apply(&store2, &root2, &order_path, None, None, true).unwrap();
+    assert_eq!(applied, v1);
+    assert_eq!(fs::read(root2.join("a.txt")).unwrap(), b"hello");
+
+    // A forged order (valid shape, bogus sig) refuses.
+    let forged = root.join("forged.json");
+    let mut o: serde_json::Value = serde_json::from_slice(&fs::read(&order_path).unwrap()).unwrap();
+    o["payload"] = serde_json::json!("{\"kind\":\"respawn-fleet-order\",\"fabric_id\":\"x\",\"target\":\"00\",\"ts\":1,\"nonce\":\"n\"}");
+    fs::write(&forged, serde_json::to_vec(&o).unwrap()).unwrap();
+    assert!(fleet::apply(&store2, &root2, &forged, None, None, true).is_err());
+
+    // Stale replay: mint a newer order, apply it, then re-present the
+    // older one — monotonic apply refuses to roll back again.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let v2 = snapshot::list(&store).unwrap()[0].0;
+    let order2_path = root.join("order2.json");
+    fleet::order(&store, &respawned::hash_hex(&v2), &order2_path).unwrap();
+    fleet::apply(&store2, &root2, &order2_path, None, None, true).unwrap();
+    assert!(fleet::apply(&store2, &root2, &order_path, None, None, true).is_err());
 }
