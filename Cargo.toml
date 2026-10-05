@@ -1,11 +1,15 @@
 [package]
 name = "respawned"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
+rust-version = "1.75"
 description = "Versioned respawn: content-addressed snapshots, atomic revert, drift detection, LAN sync"
 license = "MIT"
 authors = ["Adam Clark <savagetism@icloud.com>"]
 repository = "https://github.com/savageAZfck/respawn"
+homepage = "https://github.com/savageAZfck/respawn"
+keywords = ["snapshots", "undo", "backup", "versioning", "replication"]
+categories = ["filesystem", "data-structures"]
 
 [dependencies]
 blake3 = "1.5"

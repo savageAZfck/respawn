@@ -23,7 +23,7 @@ use std::process::Command;
 /// A mounted APFS local snapshot. Drop cleans up: unmount, remove the
 /// temp dir, delete the APFS snapshot so Time Machine space is not held.
 pub struct ApfsSnap {
-    /// Snapshot name as APFS knows it (com.apple.TimeMachine.<stamp>).
+    /// Snapshot name as APFS knows it (`com.apple.TimeMachine.<stamp>`).
     name: String,
     /// Device node of the snapped volume (e.g. /dev/disk3s1s1).
     device: String,

@@ -18,7 +18,7 @@ pub const MIN_INTERVAL_SECS: u64 = 60;
 /// Everything install needs, resolved and validated up front — the
 /// plist is generated only from checked values.
 pub struct ScheduleSpec {
-    /// LaunchAgent label: com.respawn.anchor.<fabric-id prefix>.
+    /// LaunchAgent label: `com.respawn.anchor.<fabric-id prefix>`.
     pub label: String,
     /// Absolute path to the respawn binary that will run.
     pub exe: PathBuf,
@@ -30,7 +30,7 @@ pub struct ScheduleSpec {
     pub every: u64,
     /// stdout/stderr target for the agent.
     pub log: PathBuf,
-    /// ~/Library/LaunchAgents/<label>.plist
+    /// `~/Library/LaunchAgents/<label>.plist`
     pub plist_path: PathBuf,
 }
 

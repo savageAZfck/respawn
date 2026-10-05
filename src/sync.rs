@@ -2,8 +2,8 @@
 //!
 //! Wire protocol (TCP, little-endian):
 //!   frame = u32 len + payload
-//!   payload[0] = opcode
-//!     0x01 GET_HEAD      → [has:u8][hash:32]
+//!   `payload[0]` = opcode
+//!     0x01 GET_HEAD      → `[has:u8][hash:32]`
 //!     0x02 GET_MANIFEST  + hash → u64 len + bytes (0 = missing)
 //!     0x03 HAVE          + u32 n + n hashes → n bytes (0/1)
 //!     0x04 GET_OBJECT    + hash → u64 len + bytes (0 = missing)
